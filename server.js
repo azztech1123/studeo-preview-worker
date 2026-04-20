@@ -437,7 +437,10 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     await page.waitForTimeout(300);
 
     // Let Studeo's library.js inject <video> elements + our route warm up.
-    await page.waitForTimeout(1500);
+    // Extra buffer so the cover is actually PAINTED and stable before we
+    // mark choreoStartMs — otherwise the cover dwell burns on a blank/loading
+    // screen and the real cover content barely appears in the recording.
+    await page.waitForTimeout(2500);
 
     const snap = async (label) => {
       try {
@@ -448,28 +451,49 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     };
 
     // === CHOREOGRAPHY (locked) ===
+    // Studeo's page transition takes ~800-1000ms (fade + React mount + WebM fetch
+    // over HTTPS → Railway). We need to WAIT for the transition to finish
+    // before counting dwell time, otherwise most of each "dwell" is spent
+    // looking at the outgoing spread, not the incoming one.
+    //
+    //   0.0s  Cover dwell       2.0s
+    //   2.0s  → transition      1.2s (not counted as dwell)
+    //   3.2s  Spread 2 dwell    3.0s
+    //   6.2s  → transition      1.2s
+    //   7.4s  Spread 3 dwell    3.0s
+    //   10.4s ← transition      1.2s
+    //   11.6s Spread 2 dwell    1.5s
+    //   13.1s ← transition      1.2s
+    //   14.3s Cover dwell       1.5s
+    //   15.8s tail               0.5s
+    //   16.3s total
     const choreoStartMs = Date.now();
 
     await snap('t=0_cover');
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2000);                 // cover dwell
+
     await page.keyboard.press('ArrowRight');
-    await page.waitForTimeout(300);
-    await snap('t=2_after-right-1');
-    await page.waitForTimeout(3700);
+    await page.waitForTimeout(1200);                 // transition to spread 2
+    await snap('t=3.2_spread-2-in');
+    await page.waitForTimeout(3000);                 // spread 2 dwell
+
     await page.keyboard.press('ArrowRight');
-    await page.waitForTimeout(300);
-    await snap('t=6_after-right-2');
-    await page.waitForTimeout(3700);
+    await page.waitForTimeout(1200);                 // transition to spread 3
+    await snap('t=7.4_spread-3-in');
+    await page.waitForTimeout(3000);                 // spread 3 dwell
+
     await page.keyboard.press('ArrowLeft');
-    await page.waitForTimeout(300);
-    await snap('t=10_after-left-1');
-    await page.waitForTimeout(1700);
+    await page.waitForTimeout(1200);                 // transition back to spread 2
+    await snap('t=11.6_spread-2-back');
+    await page.waitForTimeout(1500);                 // brief dwell on way back
+
     await page.keyboard.press('ArrowLeft');
-    await page.waitForTimeout(300);
-    await snap('t=12_after-left-2');
-    await page.waitForTimeout(1700);
-    await page.waitForTimeout(600);
-    await snap('t=14_tail');
+    await page.waitForTimeout(1200);                 // transition back to cover
+    await snap('t=14.3_cover-back');
+    await page.waitForTimeout(1500);                 // final cover dwell
+
+    await page.waitForTimeout(500);                  // tail
+    await snap('t=16.3_tail');
 
     const choreoEndMs = Date.now();
 
@@ -488,12 +512,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
       console.warn(`[${jobId}] stop warn: ${e.message}`);
     }
 
-    const trimStart = Math.max(
-      0,
-      (choreoStartMs - sessionStartMs) / 1000 - 0.2
-    );
     const trimDuration = (choreoEndMs - choreoStartMs) / 1000;
-    log.trimStart = Number(trimStart.toFixed(2));
     log.trimDuration = Number(trimDuration.toFixed(2));
 
     console.log(`[${jobId}] polling for recording url`);
@@ -501,6 +520,18 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
 
     const rawPath = path.join(PREVIEWS_DIR, `${jobId}_raw.mp4`);
     await downloadToFile(rawVideoUrl, rawPath);
+
+    // Anchor trim from the END of the raw recording, not from a guessed
+    // sessionStartMs offset. HB's recording clock is not synchronized with
+    // our Node.js Date.now() — the raw can easily be 25+ seconds of preamble
+    // (session boot, page load, buffer waits) before choreography begins.
+    // Since hb.sessions.stop() was called immediately after choreoEndMs, the
+    // LAST trimDuration seconds of the raw ARE our choreography window.
+    const rawDuration = await probeDuration(rawPath);
+    log.rawDuration = Number(rawDuration.toFixed(2));
+    const tailCushion = 0.3; // small buffer in case HB appends frames after stop()
+    const trimStart = Math.max(0, rawDuration - trimDuration - tailCushion);
+    log.trimStart = Number(trimStart.toFixed(2));
 
     const outPath = path.join(PREVIEWS_DIR, `${jobId}.mp4`);
     await trimMp4(rawPath, outPath, trimStart, trimDuration);
