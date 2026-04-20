@@ -380,9 +380,11 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
       try {
         await route.fulfill({
           status: 200,
-          contentType: 'video/webm; codecs="vp8"',
+          contentType: 'video/webm',
           headers: {
             'access-control-allow-origin': '*',
+            'accept-ranges': 'bytes',
+            'cache-control': 'public, max-age=3600',
           },
           body,
         });
