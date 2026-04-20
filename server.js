@@ -95,10 +95,14 @@ function cleanOldPreviews() {
 
 // ─── Single render attempt ─────────────────────────────────────────────────
 async function renderOnce(storybookUrl) {
-  const session = await hb.sessions.create({
-    enableWebRecording: true,
-    enableVideoWebRecording: true,
-  });
+const session = await hb.sessions.create({
+     enableWebRecording: true,
+     enableVideoWebRecording: true,
+     screen: {
+       width: 1920,
+       height: 1080,
+     },
+   });
   const sessionStartMs = Date.now(); // HB recording begins ~here
 
   let browser;
