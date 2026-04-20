@@ -160,12 +160,70 @@ const AUTOPLAY_INIT = `
   const start = () => {
     scan(document);
     mo.observe(document.documentElement, { childList: true, subtree: true });
+    // Persistent kicker: every 1s, force-play anything paused. Survives Studeo's
+    // own pause() calls on page transitions, autoplay policy races, buffer stalls.
+    setInterval(() => {
+      try {
+        document.querySelectorAll('video').forEach((v) => {
+          if (v.paused || v.ended) {
+            try {
+              v.muted = true;
+              const p = v.play();
+              if (p && p.catch) p.catch(() => {});
+            } catch {}
+          }
+        });
+      } catch {}
+    }, 1000);
   };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start);
   } else {
     start();
   }
+})();
+`;
+
+// Diagnostic probe — runs inside the page, returns a JSON-serializable snapshot
+// of all media elements and key slot structures. Lets us see what the DOM
+// actually looks like after Studeo's React+library.js hydration.
+const DIAGNOSTIC_PROBE = `
+(() => {
+  const out = { videos: [], imageSlots: [], canvases: 0, iframes: [] };
+  try {
+    document.querySelectorAll('video').forEach((v, i) => {
+      out.videos.push({
+        i,
+        src: (v.currentSrc || v.src || '').slice(0, 120),
+        paused: v.paused,
+        ended: v.ended,
+        muted: v.muted,
+        readyState: v.readyState,
+        networkState: v.networkState,
+        currentTime: Number((v.currentTime || 0).toFixed(2)),
+        duration: Number((v.duration || 0).toFixed(2)) || null,
+        error: v.error ? v.error.code : null,
+        w: v.videoWidth, h: v.videoHeight,
+      });
+    });
+    document.querySelectorAll('[id^="image2"], [id^="image1"]').forEach((el) => {
+      const children = Array.from(el.children).map((c) => c.tagName.toLowerCase());
+      out.imageSlots.push({
+        id: el.id,
+        childTags: children.slice(0, 8),
+        hasVideo: !!el.querySelector('video'),
+        hasImg: !!el.querySelector('img'),
+        hasCanvas: !!el.querySelector('canvas'),
+      });
+    });
+    out.canvases = document.querySelectorAll('canvas').length;
+    document.querySelectorAll('iframe').forEach((f) => {
+      out.iframes.push({ src: (f.src || '').slice(0, 80) });
+    });
+  } catch (e) {
+    out.error = e.message;
+  }
+  return out;
 })();
 `;
 
@@ -220,7 +278,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
       throw new Error(`BOOK_TOO_SHORT: only ${pageCount} pages (need >=5)`);
     }
 
-    // Focus the document without clicking (body click throws viewport errors).
+    // Focus the document without clicking the body (body click throws viewport errors).
     await page.evaluate(() => {
       try {
         window.focus();
@@ -228,12 +286,16 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
       } catch {}
     });
 
-    // Establish user activation for Chromium's autoplay policy.
-    // Tab is a keyboard gesture that doesn't move anything visually.
+    // User activation for Chromium autoplay policy.
+    // A real mouse click in the middle of the viewport generates a pointer event,
+    // which is the strongest signal to the browser that a user is present.
+    // Tab kept as a second belt-and-suspenders gesture.
+    await page.mouse.click(960, 540);
+    await page.waitForTimeout(200);
     await page.keyboard.press('Tab');
     await page.waitForTimeout(300);
 
-    // Now that we have user activation, force-play anything that didn't auto-start.
+    // Force-play every video now that we have user activation.
     await page.evaluate(() => {
       document.querySelectorAll('video').forEach((v) => {
         try {
@@ -243,7 +305,18 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
         } catch {}
       });
     });
-    await page.waitForTimeout(400);
+    // Give videos real time to buffer + start playing before we begin choreography.
+    await page.waitForTimeout(1500);
+
+    // Diagnostic: capture what's actually in the DOM right before choreography.
+    // If cinemagraphs still freeze, this tells us whether they're <video> tags,
+    // whether they're paused, whether they have errors, or whether Studeo rendered
+    // them as something else entirely.
+    try {
+      log.diagnostic = await page.evaluate(DIAGNOSTIC_PROBE);
+    } catch (e) {
+      log.diagnostic = { error: e.message };
+    }
 
     // === CHOREOGRAPHY (locked) ===
     // t=0 spread1 dwell 2s
