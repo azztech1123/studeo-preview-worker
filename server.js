@@ -189,8 +189,7 @@ function transcodeToWebmVp8(srcPath, destPath) {
       '-y',
       '-i', srcPath,
       '-c:v', 'libvpx',            // VP8 — Chromium supports natively
-      '-b:v', '1M',                 // 1 Mbps keeps file size small (~1-2MB per clip)
-      '-vf', 'scale=1280:-2',       // cap width at 1280px; smaller files transfer faster over CDP
+      '-b:v', '2M',                 // 2 Mbps: proven to produce decodable VP8 even at cpu-used 16
       '-cpu-used', '16',            // max speed preset
       '-deadline', 'realtime',
       '-threads', '4',
