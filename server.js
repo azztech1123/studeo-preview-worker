@@ -126,6 +126,41 @@ async function pollVideoUrl(sessionId, timeoutMs = 120000) {
 // allows them and so Studeo's player's internal .play() call succeeds.
 const AUTOPLAY_INIT = `
 (() => {
+  // --- diagnostic collector (global, accumulates across choreography) ---
+  window.__diag = { snaps: [], t0: Date.now() };
+  window.__snap = (label) => {
+    try {
+      window.__diag.snaps.push({
+        label,
+        t_ms: Date.now() - window.__diag.t0,
+        videos: [...document.querySelectorAll('video')].map((v) => ({
+          src: (v.currentSrc || v.src || '').slice(0, 120),
+          paused: v.paused,
+          ended: v.ended,
+          muted: v.muted,
+          readyState: v.readyState,
+          networkState: v.networkState,
+          ct: Number((v.currentTime || 0).toFixed(2)),
+          dur: Number((v.duration || 0).toFixed(2)) || null,
+          w: v.videoWidth,
+          h: v.videoHeight,
+          err: v.error ? v.error.code : null,
+        })),
+        slots: [...document.querySelectorAll('[id="image1"], [id="image2"]')].map((s) => ({
+          id: s.id,
+          childTags: [...s.children].map((c) => c.tagName.toLowerCase()).slice(0, 6),
+          inner: (s.innerHTML || '').slice(0, 400),
+        })),
+        activePage: (document.querySelector('.page[data-name]') || {}).getAttribute
+          ? document.querySelector('.page[data-name]').getAttribute('data-name')
+          : null,
+      });
+    } catch (e) {
+      window.__diag.snaps.push({ label, error: e.message });
+    }
+  };
+
+  // --- video autoplay hardening ---
   const configure = (v) => {
     try {
       v.muted = true;
@@ -160,8 +195,6 @@ const AUTOPLAY_INIT = `
   const start = () => {
     scan(document);
     mo.observe(document.documentElement, { childList: true, subtree: true });
-    // Persistent kicker: every 1s, force-play anything paused. Survives Studeo's
-    // own pause() calls on page transitions, autoplay policy races, buffer stalls.
     setInterval(() => {
       try {
         document.querySelectorAll('video').forEach((v) => {
@@ -184,48 +217,8 @@ const AUTOPLAY_INIT = `
 })();
 `;
 
-// Diagnostic probe — runs inside the page, returns a JSON-serializable snapshot
-// of all media elements and key slot structures. Lets us see what the DOM
-// actually looks like after Studeo's React+library.js hydration.
-const DIAGNOSTIC_PROBE = `
-(() => {
-  const out = { videos: [], imageSlots: [], canvases: 0, iframes: [] };
-  try {
-    document.querySelectorAll('video').forEach((v, i) => {
-      out.videos.push({
-        i,
-        src: (v.currentSrc || v.src || '').slice(0, 120),
-        paused: v.paused,
-        ended: v.ended,
-        muted: v.muted,
-        readyState: v.readyState,
-        networkState: v.networkState,
-        currentTime: Number((v.currentTime || 0).toFixed(2)),
-        duration: Number((v.duration || 0).toFixed(2)) || null,
-        error: v.error ? v.error.code : null,
-        w: v.videoWidth, h: v.videoHeight,
-      });
-    });
-    document.querySelectorAll('[id^="image2"], [id^="image1"]').forEach((el) => {
-      const children = Array.from(el.children).map((c) => c.tagName.toLowerCase());
-      out.imageSlots.push({
-        id: el.id,
-        childTags: children.slice(0, 8),
-        hasVideo: !!el.querySelector('video'),
-        hasImg: !!el.querySelector('img'),
-        hasCanvas: !!el.querySelector('canvas'),
-      });
-    });
-    out.canvases = document.querySelectorAll('canvas').length;
-    document.querySelectorAll('iframe').forEach((f) => {
-      out.iframes.push({ src: (f.src || '').slice(0, 80) });
-    });
-  } catch (e) {
-    out.error = e.message;
-  }
-  return out;
-})();
-`;
+// No longer used — snapshots happen during choreography instead.
+const DIAGNOSTIC_PROBE = '(() => ({deprecated: true}))()';
 
 // ---------- one render attempt ----------
 
@@ -249,6 +242,34 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     browser = await chromium.connectOverCDP(session.wsEndpoint);
     const context = browser.contexts()[0] || (await browser.newContext());
     const page = context.pages()[0] || (await context.newPage());
+
+    // Network trace: record any request that looks like a video asset.
+    const mediaRequests = [];
+    const requestStart = Date.now();
+    page.on('request', (req) => {
+      const url = req.url();
+      if (
+        /mux\.com|cinemagraph|\.mp4(\?|$)|\.webm(\?|$)|\.m3u8(\?|$)/i.test(url)
+      ) {
+        mediaRequests.push({
+          t_ms: Date.now() - requestStart,
+          method: req.method(),
+          url: url.slice(0, 150),
+          resourceType: req.resourceType(),
+        });
+      }
+    });
+    page.on('requestfailed', (req) => {
+      const url = req.url();
+      if (/mux\.com|\.mp4(\?|$)|\.webm(\?|$)/i.test(url)) {
+        mediaRequests.push({
+          t_ms: Date.now() - requestStart,
+          failed: true,
+          url: url.slice(0, 150),
+          failure: req.failure()?.errorText,
+        });
+      }
+    });
 
     // Arm autoplay-hardening BEFORE navigation so it runs on document creation.
     await page.addInitScript(AUTOPLAY_INIT);
@@ -308,37 +329,46 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     // Give videos real time to buffer + start playing before we begin choreography.
     await page.waitForTimeout(1500);
 
-    // Diagnostic: capture what's actually in the DOM right before choreography.
-    // If cinemagraphs still freeze, this tells us whether they're <video> tags,
-    // whether they're paused, whether they have errors, or whether Studeo rendered
-    // them as something else entirely.
-    try {
-      log.diagnostic = await page.evaluate(DIAGNOSTIC_PROBE);
-    } catch (e) {
-      log.diagnostic = { error: e.message };
-    }
+    // Helper to snapshot DOM state at the current choreography moment.
+    const snap = async (label) => {
+      try {
+        await page.evaluate(`window.__snap && window.__snap(${JSON.stringify(label)})`);
+      } catch {}
+    };
 
     // === CHOREOGRAPHY (locked) ===
-    // t=0 spread1 dwell 2s
-    // t=2 →  spread2 dwell 4s
-    // t=6 →  spread3 dwell 4s
-    // t=10 ← spread2 dwell 2s
-    // t=12 ← spread1 dwell 2s
-    // t=14 tail 0.6s
     const choreoStartMs = Date.now();
 
+    await snap('t=0_cover');
     await page.waitForTimeout(2000);
     await page.keyboard.press('ArrowRight');
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(300);
+    await snap('t=2_after-right-1');
+    await page.waitForTimeout(3700);
     await page.keyboard.press('ArrowRight');
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(300);
+    await snap('t=6_after-right-2');
+    await page.waitForTimeout(3700);
     await page.keyboard.press('ArrowLeft');
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(300);
+    await snap('t=10_after-left-1');
+    await page.waitForTimeout(1700);
     await page.keyboard.press('ArrowLeft');
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(300);
+    await snap('t=12_after-left-2');
+    await page.waitForTimeout(1700);
     await page.waitForTimeout(600);
+    await snap('t=14_tail');
 
     const choreoEndMs = Date.now();
+
+    // Read back collected diagnostics before tearing down the browser.
+    try {
+      log.snapshots = await page.evaluate(() => window.__diag && window.__diag.snaps);
+    } catch (e) {
+      log.snapshots = { error: e.message };
+    }
+    log.mediaRequests = mediaRequests;
 
     // Close CDP connection; recording is server-side and finalizes on stop.
     try { await browser.close(); } catch {}
