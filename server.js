@@ -188,12 +188,13 @@ function transcodeToWebmVp8(srcPath, destPath) {
     const args = [
       '-y',
       '-i', srcPath,
-      '-c:v', 'libvpx',      // VP8 — Chromium supports natively
-      '-b:v', '2M',          // 2 Mbps, plenty for 1080p cinemagraph
-      '-cpu-used', '16',     // max speed preset
+      '-c:v', 'libvpx',            // VP8 — Chromium supports natively
+      '-b:v', '1M',                 // 1 Mbps keeps file size small (~1-2MB per clip)
+      '-vf', 'scale=1280:-2',       // cap width at 1280px; smaller files transfer faster over CDP
+      '-cpu-used', '16',            // max speed preset
       '-deadline', 'realtime',
       '-threads', '4',
-      '-an',                 // cinemagraphs are silent anyway
+      '-an',                        // cinemagraphs are silent anyway
       '-f', 'webm',
       destPath,
     ];
@@ -353,9 +354,11 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     const routeStart = Date.now();
 
     // THE KEY HOOK: intercept Mux video requests, serve local WebM.
-    // Handles Range headers properly (returns 206 Partial Content with
-    // Content-Range) — video elements often probe metadata via byte ranges,
-    // and returning a full 200 response to a Range request can stall them.
+    // Plain 200 response with full body + explicit vp8 codec in Content-Type.
+    // (v8 tried 206/Range handling and it made things WORSE — Chromium's
+    // media engine kept the decoder waiting for "more" data even when we'd
+    // served the whole file, because 206 Partial Content literally means
+    // partial. Plain 200 tells it "this is everything, go.")
     await page.route('**/stream.mux.com/**', async (route) => {
       const req = route.request();
       const url = req.url();
@@ -374,39 +377,16 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
         return;
       }
 
-      const rangeHeader = req.headers()['range'];
       try {
-        if (rangeHeader) {
-          const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
-          const start = m ? parseInt(m[1], 10) : 0;
-          const end = m && m[2] ? parseInt(m[2], 10) : body.length - 1;
-          const chunk = body.subarray(start, end + 1);
-          await route.fulfill({
-            status: 206,
-            contentType: 'video/webm',
-            headers: {
-              'accept-ranges': 'bytes',
-              'content-range': `bytes ${start}-${end}/${body.length}`,
-              'content-length': String(chunk.length),
-              'access-control-allow-origin': '*',
-            },
-            body: chunk,
-          });
-          entry.outcome = 'fulfilled_206';
-          entry.range = `${start}-${end}`;
-        } else {
-          await route.fulfill({
-            status: 200,
-            contentType: 'video/webm',
-            headers: {
-              'accept-ranges': 'bytes',
-              'content-length': String(body.length),
-              'access-control-allow-origin': '*',
-            },
-            body,
-          });
-          entry.outcome = 'fulfilled_200';
-        }
+        await route.fulfill({
+          status: 200,
+          contentType: 'video/webm; codecs="vp8"',
+          headers: {
+            'access-control-allow-origin': '*',
+          },
+          body,
+        });
+        entry.outcome = 'fulfilled';
       } catch (e) {
         entry.outcome = 'fulfill_error';
         entry.err = e.message;
