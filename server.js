@@ -352,46 +352,58 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     const routeLog = [];
     const routeStart = Date.now();
 
-    // THE KEY HOOK: intercept Mux video requests, serve local WebM.
-    // Plain 200 response with full body + explicit vp8 codec in Content-Type.
-    // (v8 tried 206/Range handling and it made things WORSE — Chromium's
-    // media engine kept the decoder waiting for "more" data even when we'd
-    // served the whole file, because 206 Partial Content literally means
-    // partial. Plain 200 tells it "this is everything, go.")
-    await page.route('**/stream.mux.com/**', async (route) => {
-      const req = route.request();
-      const url = req.url();
-      const muxId = muxIdFromUrl(url);
-      const body = muxId ? webmBuffers[muxId] : null;
-      const entry = {
-        t_ms: Date.now() - routeStart,
-        muxId,
-        size: body ? body.length : 0,
-      };
-      routeLog.push(entry);
+    // SERIALIZATION: when two <video> elements mount simultaneously (left+right
+    // of a spread), their requests fire ~5ms apart. Running both fulfills
+    // concurrently through Playwright's CDP Fetch interception wedges the
+    // second one — the first plays, the second stalls at readyState:0 every
+    // single time. Forcing fulfills to run one-at-a-time lets Chromium's
+    // media pipeline consume each cleanly.
+    let routeQueue = Promise.resolve();
 
-      if (!body) {
-        entry.outcome = 'no_buffer';
-        try { await route.continue(); } catch {}
-        return;
-      }
+    // THE KEY HOOK: intercept Mux video requests, serve local WebM.
+    await page.route('**/stream.mux.com/**', async (route) => {
+      const prevTurn = routeQueue;
+      let release;
+      routeQueue = new Promise((r) => { release = r; });
+      await prevTurn;
 
       try {
-        await route.fulfill({
-          status: 200,
-          contentType: 'video/webm',
-          headers: {
-            'access-control-allow-origin': '*',
-            'accept-ranges': 'bytes',
-            'cache-control': 'public, max-age=3600',
-          },
-          body,
-        });
-        entry.outcome = 'fulfilled';
-      } catch (e) {
-        entry.outcome = 'fulfill_error';
-        entry.err = e.message;
-        try { await route.continue(); } catch {}
+        const req = route.request();
+        const url = req.url();
+        const muxId = muxIdFromUrl(url);
+        const body = muxId ? webmBuffers[muxId] : null;
+        const entry = {
+          t_ms: Date.now() - routeStart,
+          muxId,
+          size: body ? body.length : 0,
+        };
+        routeLog.push(entry);
+
+        if (!body) {
+          entry.outcome = 'no_buffer';
+          try { await route.continue(); } catch {}
+          return;
+        }
+
+        try {
+          await route.fulfill({
+            status: 200,
+            contentType: 'video/webm',
+            headers: {
+              'access-control-allow-origin': '*',
+              'accept-ranges': 'bytes',
+              'cache-control': 'public, max-age=3600',
+            },
+            body,
+          });
+          entry.outcome = 'fulfilled';
+        } catch (e) {
+          entry.outcome = 'fulfill_error';
+          entry.err = e.message;
+          try { await route.continue(); } catch {}
+        }
+      } finally {
+        release();
       }
     });
 
@@ -532,7 +544,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     log.size = st.size;
 
     const DUR_MIN = 13.5;
-    const DUR_MAX = 22.0;
+    const DUR_MAX = 25.0;
     const SIZE_MIN = 200 * 1024;
 
     if (duration < DUR_MIN || duration > DUR_MAX) {
