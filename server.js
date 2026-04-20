@@ -32,8 +32,10 @@ const hb = new Hyperbrowser({ apiKey: HB_KEY });
 //   t=12.0 ← Spread 1 (cover)         dwell 2s
 //   t=14.0 tail hold                  0.6s
 async function runChoreography(page) {
-     await page.locator('body').click({ force: true });
-     await page.evaluate(() => window.focus());
+     await page.evaluate(() => {
+       window.focus();
+       document.body?.focus();
+     });
      await page.waitForTimeout(200);
 
   await page.waitForTimeout(2000);            // Spread 1 (cover)
