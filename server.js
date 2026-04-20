@@ -199,9 +199,20 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     await page.goto(storybookUrl, { waitUntil: 'load', timeout: 30000 });
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-    // Count pages (Studeo uses `.page` with data-name)
+    // Count pages. Primary source: Studeo's __NEXT_DATA__ SSR payload
+    // (data.squirrel.number_of_pages). Fallback: DOM count of .page / [data-name]
+    // nodes. React hydration rearranges the DOM so a naive .page count can
+    // return 1 even for a 10-page book — hence the NEXT_DATA primary path.
     const pageCount = await page.evaluate(() => {
-      return document.querySelectorAll('.page').length;
+      try {
+        const el = document.getElementById('__NEXT_DATA__');
+        if (el) {
+          const j = JSON.parse(el.textContent || '{}');
+          const n = j?.props?.pageProps?.data?.squirrel?.number_of_pages;
+          if (typeof n === 'number' && n > 0) return n;
+        }
+      } catch {}
+      return document.querySelectorAll('.page, [data-name]').length;
     });
     log.pageCount = pageCount;
 
