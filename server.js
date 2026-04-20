@@ -302,7 +302,7 @@ const INIT_SCRIPT = `
 //  Main render attempt
 // ========================================================
 
-async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
+async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
   let session = null;
   let browser = null;
   const log = { attempt: attemptNum };
@@ -326,85 +326,53 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     log.pretranscode = pretranscode.stats;
     console.log(`[${jobId}] session ${session.id}`);
 
-    // PRE-LOAD every transcoded WebM into memory ONCE. This eliminates any
-    // fs.readFile race condition in the route handler — two simultaneous
-    // video requests were randomly causing one to serve correctly and the
-    // other to stall at readyState:0 when both handlers raced to read files
-    // from the thread pool. In-memory lookup is sync and bulletproof.
-    const webmBuffers = {};
-    for (const [muxId, webmPath] of Object.entries(pretranscode.byMuxId)) {
-      try {
-        webmBuffers[muxId] = await fs.readFile(webmPath);
-      } catch (e) {
-        console.warn(`[${jobId}] preload ${muxId} failed: ${e.message}`);
-      }
-    }
-    log.preloadedBuffers = Object.keys(webmBuffers).length;
-
     const sessionStartMs = Date.now();
 
     browser = await chromium.connectOverCDP(session.wsEndpoint);
     const context = browser.contexts()[0] || (await browser.newContext());
     const page = context.pages()[0] || (await context.newPage());
 
-    // Track every route interception so we can see what actually happened
-    // per request — critical for diagnosing any remaining odd behavior.
+    // Track every route interception for diagnostics.
     const routeLog = [];
     const routeStart = Date.now();
 
-    // SERIALIZATION: when two <video> elements mount simultaneously (left+right
-    // of a spread), their requests fire ~5ms apart. Running both fulfills
-    // concurrently through Playwright's CDP Fetch interception wedges the
-    // second one — the first plays, the second stalls at readyState:0 every
-    // single time. Forcing fulfills to run one-at-a-time lets Chromium's
-    // media pipeline consume each cleanly.
-    let routeQueue = Promise.resolve();
-
-    // THE KEY HOOK: intercept Mux video requests, serve local WebM.
+    // THE KEY HOOK: redirect Mux video requests to our own HTTPS endpoint
+    // at ${baseUrl}/webm/{jobId}/{muxId}.webm. Chromium follows the 302 and
+    // loads the WebM through its native HTTP pipeline — which handles
+    // concurrent video loads, range requests, and backpressure correctly.
+    //
+    // Previous approach (route.fulfill with body) wedged when two videos
+    // requested simultaneously: concurrent CDP body transfers raced and
+    // Chromium's media decoder would only accept one. Serializing fixed
+    // the race but took so long Chromium timed out. Real HTTP sidesteps
+    // both problems entirely.
     await page.route('**/stream.mux.com/**', async (route) => {
-      const prevTurn = routeQueue;
-      let release;
-      routeQueue = new Promise((r) => { release = r; });
-      await prevTurn;
+      const url = route.request().url();
+      const muxId = muxIdFromUrl(url);
+      const entry = { t_ms: Date.now() - routeStart, muxId };
+      routeLog.push(entry);
 
-      try {
-        const req = route.request();
-        const url = req.url();
-        const muxId = muxIdFromUrl(url);
-        const body = muxId ? webmBuffers[muxId] : null;
-        const entry = {
-          t_ms: Date.now() - routeStart,
-          muxId,
-          size: body ? body.length : 0,
-        };
-        routeLog.push(entry);
-
-        if (!body) {
-          entry.outcome = 'no_buffer';
-          try { await route.continue(); } catch {}
-          return;
-        }
-
+      if (muxId && pretranscode.byMuxId[muxId]) {
+        const redirectUrl = `${baseUrl}/webm/${encodeURIComponent(jobId)}/${encodeURIComponent(muxId)}.webm`;
         try {
           await route.fulfill({
-            status: 200,
-            contentType: 'video/webm',
+            status: 302,
             headers: {
+              location: redirectUrl,
               'access-control-allow-origin': '*',
-              'accept-ranges': 'bytes',
-              'cache-control': 'public, max-age=3600',
             },
-            body,
           });
-          entry.outcome = 'fulfilled';
+          entry.outcome = 'redirected';
+          entry.redirectTo = redirectUrl;
+          return;
         } catch (e) {
-          entry.outcome = 'fulfill_error';
+          entry.outcome = 'redirect_error';
           entry.err = e.message;
-          try { await route.continue(); } catch {}
         }
-      } finally {
-        release();
+      } else {
+        entry.outcome = 'no_match';
       }
+      try { await route.continue(); } catch {}
     });
 
     // Network trace for debugging
@@ -594,6 +562,46 @@ app.get('/previews/:file', (req, res) => {
   fsSync.createReadStream(fp).pipe(res);
 });
 
+// Serves transcoded WebM cinemagraphs with proper HTTP range support.
+// The Playwright route handler redirects Chromium here (302) so video loading
+// goes through Chromium's native HTTP/video pipeline instead of CDP body
+// transfer. CDP fulfill with multi-MB bodies wedged when two videos loaded
+// concurrently; real HTTP with 206 range responses handles it cleanly.
+app.get('/webm/:jobId/:muxId.webm', (req, res) => {
+  const jobId = sanitizeJobId(req.params.jobId);
+  const muxId = String(req.params.muxId).replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!muxId) return res.status(400).send('bad muxId');
+  const fp = path.join(CINEMAGRAPHS_DIR, jobId, `${muxId}.webm`);
+  if (!fsSync.existsSync(fp)) return res.status(404).send('not found');
+
+  const stat = fsSync.statSync(fp);
+  const total = stat.size;
+
+  res.setHeader('Content-Type', 'video/webm');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store');
+
+  const range = req.headers.range;
+  if (range) {
+    const m = range.match(/bytes=(\d+)-(\d*)/);
+    const start = m ? parseInt(m[1], 10) : 0;
+    const end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+    if (isNaN(start) || start < 0 || start >= total || end >= total) {
+      res.setHeader('Content-Range', `bytes */${total}`);
+      return res.status(416).send('range not satisfiable');
+    }
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+    res.setHeader('Content-Length', String(end - start + 1));
+    fsSync.createReadStream(fp, { start, end }).pipe(res);
+  } else {
+    res.status(200);
+    res.setHeader('Content-Length', String(total));
+    fsSync.createReadStream(fp).pipe(res);
+  }
+});
+
 app.post('/render-preview', async (req, res) => {
   const { storybookUrl, storybookId } = req.body || {};
   if (!storybookUrl || typeof storybookUrl !== 'string') {
@@ -608,8 +616,12 @@ app.post('/render-preview', async (req, res) => {
   let success = null;
   let rawVideoUrl = null;
 
+  const host = req.get('host');
+  const proto = req.get('x-forwarded-proto') || 'https';
+  const baseUrl = `${proto}://${host}`;
+
   for (let i = 1; i <= 3; i++) {
-    const result = await runOneAttempt({ storybookUrl, jobId, attemptNum: i });
+    const result = await runOneAttempt({ storybookUrl, jobId, attemptNum: i, baseUrl });
     attempts.push(result.log);
     if (result.ok) {
       success = result;
@@ -626,9 +638,7 @@ app.post('/render-preview', async (req, res) => {
   }
 
   const st = await fs.stat(success.outPath);
-  const host = req.get('host');
-  const proto = req.get('x-forwarded-proto') || 'https';
-  const mp4Url = `${proto}://${host}/previews/${jobId}.mp4`;
+  const mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
 
   res.json({
     mp4Url,
