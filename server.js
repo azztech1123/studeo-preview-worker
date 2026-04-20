@@ -81,7 +81,7 @@ async function renderOnce(storybookUrl) {
   let browser;
   let pageCount = null;
   try {
-    browser = await chromium.connectOverCDP(session.connectUrl);
+    browser = await chromium.connectOverCDP(session.wsEndpoint);
     const page = browser.contexts()[0].pages()[0];
     await page.setViewportSize(VIEWPORT);
 
