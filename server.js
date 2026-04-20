@@ -1,5 +1,7 @@
 // server.js — Studeo storybook 15s MP4 preview worker
-// Ogre-validated, retry-bounded, video-hostile-env-proof.
+// Pre-transcodes Mux H.264 cinemagraphs to WebM VP8 before opening the browser,
+// then intercepts <video> requests via page.route and serves the local WebM,
+// bypassing Hyperbrowser's Chromium not supporting H.264.
 import express from 'express';
 import { Hyperbrowser } from '@hyperbrowser/sdk';
 import { chromium } from 'playwright-core';
@@ -9,6 +11,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const PREVIEWS_DIR = '/tmp/previews';
+const CINEMAGRAPHS_DIR = '/tmp/cinemagraphs';
 const PORT = process.env.PORT || 3000;
 const HB_KEY = process.env.HB_KEY;
 
@@ -19,29 +22,36 @@ if (!HB_KEY) {
 
 const hb = new Hyperbrowser({ apiKey: HB_KEY });
 
-// ---------- helpers ----------
+// ========================================================
+//  helpers
+// ========================================================
 
-async function ensurePreviewsDir() {
+async function ensureDirs() {
   await fs.mkdir(PREVIEWS_DIR, { recursive: true });
+  await fs.mkdir(CINEMAGRAPHS_DIR, { recursive: true });
 }
 
-async function cleanupOldPreviews() {
-  try {
-    const files = await fs.readdir(PREVIEWS_DIR);
-    const now = Date.now();
-    const TTL_MS = 72 * 60 * 60 * 1000;
-    for (const f of files) {
-      const fp = path.join(PREVIEWS_DIR, f);
-      try {
-        const st = await fs.stat(fp);
-        if (now - st.mtimeMs > TTL_MS) {
-          await fs.unlink(fp);
-          console.log(`cleanup: removed ${f}`);
-        }
-      } catch {}
-    }
-  } catch (e) {
-    console.warn('cleanup error:', e.message);
+async function cleanupOldFiles() {
+  const TTL_MS = 72 * 60 * 60 * 1000;
+  const now = Date.now();
+  for (const dir of [PREVIEWS_DIR, CINEMAGRAPHS_DIR]) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fp = path.join(dir, entry.name);
+        try {
+          const st = await fs.stat(fp);
+          if (now - st.mtimeMs > TTL_MS) {
+            if (entry.isDirectory()) {
+              await fs.rm(fp, { recursive: true, force: true });
+            } else {
+              await fs.unlink(fp);
+            }
+            console.log(`cleanup: removed ${fp}`);
+          }
+        } catch {}
+      }
+    } catch {}
   }
 }
 
@@ -119,142 +129,178 @@ async function pollVideoUrl(sessionId, timeoutMs = 120000) {
   throw new Error(`video url unavailable: ${lastErr?.message || 'timeout'}`);
 }
 
-// ---------- autoplay-hardening init script ----------
-// Runs inside the browser on every document load, BEFORE page scripts.
-// Studeo injects Mux-hosted <video> elements after React hydrates; we must
-// configure them the instant they appear so Chromium's autoplay policy
-// allows them and so Studeo's player's internal .play() call succeeds.
-const AUTOPLAY_INIT = `
+// ========================================================
+//  Cinemagraph pre-transcoding pipeline
+// ========================================================
+//
+// THE FIX: Hyperbrowser's Chromium lacks H.264 decode. Mux serves H.264.
+// We fetch each cinemagraph ourselves, transcode MP4 → WebM VP8 with ffmpeg,
+// then intercept Mux <video> requests inside the browser via page.route()
+// and fulfill them with the local WebM. Chromium supports VP8 natively.
+//
+// Runs concurrently with the Hyperbrowser session boot so it adds ~0 to total
+// request time. VP8 at realtime preset is 8-15x real-time on typical CPUs.
+
+function muxIdFromUrl(url) {
+  const m = String(url).match(/stream\.mux\.com\/([^\/?#]+)/);
+  return m ? m[1] : null;
+}
+
+async function extractCinemagraphUrls(storybookUrl) {
+  const res = await fetch(storybookUrl, {
+    headers: {
+      'user-agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    },
+  });
+  if (!res.ok) throw new Error(`fetch storybook ${res.status}`);
+  const html = await res.text();
+  const match = html.match(
+    /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/
+  );
+  if (!match) return [];
+  let data;
+  try {
+    data = JSON.parse(match[1]);
+  } catch {
+    return [];
+  }
+  const urls = new Set();
+  const walk = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (
+      obj.type === 'cinemagraph' &&
+      typeof obj.value === 'string' &&
+      obj.value.startsWith('http') &&
+      obj.value.includes('mux.com')
+    ) {
+      urls.add(obj.value);
+    }
+    if (Array.isArray(obj)) obj.forEach(walk);
+    else Object.values(obj).forEach(walk);
+  };
+  walk(data);
+  return [...urls];
+}
+
+function transcodeToWebmVp8(srcPath, destPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-y',
+      '-i', srcPath,
+      '-c:v', 'libvpx',      // VP8 — Chromium supports natively
+      '-b:v', '2M',          // 2 Mbps, plenty for 1080p cinemagraph
+      '-cpu-used', '16',     // max speed preset
+      '-deadline', 'realtime',
+      '-threads', '4',
+      '-an',                 // cinemagraphs are silent anyway
+      '-f', 'webm',
+      destPath,
+    ];
+    const proc = spawn('ffmpeg', args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => (stderr += d));
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`webm transcode exit ${code}: ${stderr.slice(-300)}`));
+    });
+    proc.on('error', reject);
+  });
+}
+
+async function pretranscodeCinemagraphs(storybookUrl, jobId) {
+  const result = {
+    byMuxId: {},
+    stats: { found: 0, transcoded: 0, failed: 0, skipped: 0, elapsedMs: 0 },
+  };
+  const t0 = Date.now();
+  let urls;
+  try {
+    urls = await extractCinemagraphUrls(storybookUrl);
+  } catch (e) {
+    console.warn(`[${jobId}] cinemagraph extraction failed: ${e.message}`);
+    result.stats.error = e.message;
+    return result;
+  }
+  result.stats.found = urls.length;
+  if (urls.length === 0) return result;
+
+  const dir = path.join(CINEMAGRAPHS_DIR, jobId);
+  await fs.mkdir(dir, { recursive: true });
+
+  await Promise.all(
+    urls.map(async (url) => {
+      const muxId = muxIdFromUrl(url);
+      if (!muxId) {
+        result.stats.skipped++;
+        return;
+      }
+      const mp4Path = path.join(dir, `${muxId}.mp4`);
+      const webmPath = path.join(dir, `${muxId}.webm`);
+      try {
+        const dl = await fetch(url);
+        if (!dl.ok) throw new Error(`download ${dl.status}`);
+        const buf = Buffer.from(await dl.arrayBuffer());
+        await fs.writeFile(mp4Path, buf);
+        await transcodeToWebmVp8(mp4Path, webmPath);
+        result.byMuxId[muxId] = webmPath;
+        result.stats.transcoded++;
+        await fs.unlink(mp4Path).catch(() => {});
+      } catch (e) {
+        console.warn(`[${jobId}] transcode ${muxId} failed: ${e.message}`);
+        result.stats.failed++;
+      }
+    })
+  );
+
+  result.stats.elapsedMs = Date.now() - t0;
+  console.log(
+    `[${jobId}] pretranscode: ${result.stats.transcoded}/${result.stats.found} in ${result.stats.elapsedMs}ms`
+  );
+  return result;
+}
+
+// ========================================================
+//  Browser-side diagnostic probe (minimal)
+// ========================================================
+
+const INIT_SCRIPT = `
 (() => {
-  // Diagnostic collector + media-method tracer.
-  // We are NO LONGER interfering with Studeo's player. Just observing.
-  // This isolates whether the ERR_ABORTED cascade is coming from our code,
-  // Studeo's library.js, or somewhere else.
-  window.__diag = { snaps: [], calls: [], t0: Date.now(), wrapError: null };
-
-  // CODEC CAPABILITY PROBE — the critical test. Playwright's bundled Chromium
-  // typically lacks H.264 (MPEG-4 AVC) because of patent encumbrance. If
-  // canPlayType returns "" for avc1.* codecs, we've found the root cause of
-  // the ~80ms ERR_ABORTED pattern: Chrome fetches headers, detects unsupported
-  // codec, aborts. Studeo retries every 4s, same result. Infinite loop.
-  try {
-    const probe = document.createElement('video');
-    window.__diag.codecs = {
-      mp4_generic: probe.canPlayType('video/mp4'),
-      h264_baseline: probe.canPlayType('video/mp4; codecs="avc1.42E01E"'),
-      h264_main: probe.canPlayType('video/mp4; codecs="avc1.4D401F"'),
-      h264_high: probe.canPlayType('video/mp4; codecs="avc1.64001F"'),
-      aac: probe.canPlayType('audio/mp4; codecs="mp4a.40.2"'),
-      webm_vp8: probe.canPlayType('video/webm; codecs="vp8"'),
-      webm_vp9: probe.canPlayType('video/webm; codecs="vp9"'),
-      av1: probe.canPlayType('video/mp4; codecs="av01.0.04M.08"'),
-    };
-  } catch (e) {
-    window.__diag.codecError = e.message;
-  }
-
-  // Manual fetch test — confirms whether the network path to Mux works at all
-  // (i.e., CORS, DNS, connectivity). If fetch() returns 200 but <video> aborts,
-  // the issue is codec decode, not network.
-  window.__testMuxFetch = async (url) => {
-    try {
-      const resp = await fetch(url, { method: 'GET', mode: 'cors' });
-      const reader = resp.body.getReader();
-      const first = await reader.read();
-      reader.cancel();
-      return {
-        ok: resp.ok,
-        status: resp.status,
-        type: resp.type,
-        contentType: resp.headers.get('content-type'),
-        contentLength: resp.headers.get('content-length'),
-        firstBytes: first.value ? first.value.byteLength : 0,
-      };
-    } catch (e) {
-      return { err: e.message };
-    }
-  };
-
-  const logCall = (method, el, extra) => {
-    try {
-      window.__diag.calls.push({
-        m: method,
-        t_ms: Date.now() - window.__diag.t0,
-        src: (el.currentSrc || el.src || '').slice(-50),
-        ns: el.networkState,
-        rs: el.readyState,
-        ...(extra || {}),
-      });
-    } catch {}
-  };
-
-  // Wrap HTMLMediaElement.prototype.load — this is the usual culprit for ABORT.
-  try {
-    const proto = HTMLMediaElement.prototype;
-    const origLoad = proto.load;
-    proto.load = function () {
-      logCall('load', this);
-      return origLoad.apply(this, arguments);
-    };
-    const origPause = proto.pause;
-    proto.pause = function () {
-      logCall('pause', this);
-      return origPause.apply(this, arguments);
-    };
-    const origPlay = proto.play;
-    proto.play = function () {
-      logCall('play', this);
-      return origPlay.apply(this, arguments);
-    };
-    // Wrap the src setter so we see every assignment (including resets to '').
-    const srcDesc = Object.getOwnPropertyDescriptor(proto, 'src');
-    if (srcDesc && srcDesc.configurable) {
-      Object.defineProperty(proto, 'src', {
-        configurable: true,
-        get: srcDesc.get,
-        set: function (v) {
-          logCall('set src', this, { to: String(v).slice(-60) });
-          return srcDesc.set.call(this, v);
-        },
-      });
-    }
-  } catch (e) {
-    window.__diag.wrapError = e.message;
-  }
-
+  window.__diag = { snaps: [], t0: Date.now() };
   window.__snap = (label) => {
     try {
       window.__diag.snaps.push({
         label,
         t_ms: Date.now() - window.__diag.t0,
         videos: [...document.querySelectorAll('video')].map((v) => ({
-          src: (v.currentSrc || v.src || '').slice(0, 100),
+          src: (v.currentSrc || v.src || '').slice(-80),
           paused: v.paused,
-          muted: v.muted,
           readyState: v.readyState,
           networkState: v.networkState,
           ct: Number((v.currentTime || 0).toFixed(2)),
           w: v.videoWidth,
           h: v.videoHeight,
           err: v.error ? v.error.code : null,
-          crossOrigin: v.crossOrigin,
-          preload: v.preload,
-          attrs: [...v.attributes].map((a) => a.name + '=' + a.value.slice(0, 40)).slice(0, 8),
         })),
-        activePage: document.querySelector('.page[data-name]')
-          ? document.querySelector('.page[data-name]').getAttribute('data-name')
-          : null,
       });
     } catch (e) {
       window.__diag.snaps.push({ label, error: e.message });
     }
   };
+  try {
+    const probe = document.createElement('video');
+    window.__diag.codecs = {
+      h264: probe.canPlayType('video/mp4; codecs="avc1.42E01E"'),
+      vp8: probe.canPlayType('video/webm; codecs="vp8"'),
+      vp9: probe.canPlayType('video/webm; codecs="vp9"'),
+    };
+  } catch {}
 })();
 `;
 
-const DIAGNOSTIC_PROBE = '(() => ({deprecated: true}))()';
-
-// ---------- one render attempt ----------
+// ========================================================
+//  Main render attempt
+// ========================================================
 
 async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
   let session = null;
@@ -262,13 +308,22 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
   const log = { attempt: attemptNum };
 
   try {
-    console.log(`[${jobId}] attempt ${attemptNum}: creating session`);
-    session = await hb.sessions.create({
-      enableWebRecording: true,
-      enableVideoWebRecording: true,
-      screen: { width: 1920, height: 1080 },
-    });
+    console.log(`[${jobId}] attempt ${attemptNum}: creating session + pretranscoding in parallel`);
+
+    // Session create + cinemagraph pretranscoding run concurrently.
+    // Both take ~5-10s; running them in parallel means total setup ≈ max(both),
+    // not sum. Net wall-clock cost of the cinemagraph fix is near zero.
+    const [sessionResult, pretranscode] = await Promise.all([
+      hb.sessions.create({
+        enableWebRecording: true,
+        enableVideoWebRecording: true,
+        screen: { width: 1920, height: 1080 },
+      }),
+      pretranscodeCinemagraphs(storybookUrl, jobId),
+    ]);
+    session = sessionResult;
     log.sessionId = session.id;
+    log.pretranscode = pretranscode.stats;
     console.log(`[${jobId}] session ${session.id}`);
 
     const sessionStartMs = Date.now();
@@ -277,19 +332,45 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     const context = browser.contexts()[0] || (await browser.newContext());
     const page = context.pages()[0] || (await context.newPage());
 
-    // Network trace: record any request that looks like a video asset.
+    // THE KEY HOOK: intercept every Mux video request and serve our local
+    // pre-transcoded WebM instead of letting Chromium fetch H.264 and choke.
+    await page.route('**/stream.mux.com/**', async (route) => {
+      const url = route.request().url();
+      const muxId = muxIdFromUrl(url);
+      const webmPath = muxId ? pretranscode.byMuxId[muxId] : null;
+      if (webmPath) {
+        try {
+          const body = await fs.readFile(webmPath);
+          await route.fulfill({
+            status: 200,
+            contentType: 'video/webm',
+            headers: {
+              'access-control-allow-origin': '*',
+              'accept-ranges': 'bytes',
+              'cache-control': 'public, max-age=3600',
+            },
+            body,
+          });
+          return;
+        } catch (e) {
+          console.warn(`[${jobId}] route fulfill failed ${muxId}: ${e.message}`);
+        }
+      }
+      // Fallthrough: let the request go through (will fail with ERR_ABORTED,
+      // same as before — but no worse than current state).
+      route.continue();
+    });
+
+    // Network trace for debugging
     const mediaRequests = [];
     const requestStart = Date.now();
     page.on('request', (req) => {
       const url = req.url();
-      if (
-        /mux\.com|cinemagraph|\.mp4(\?|$)|\.webm(\?|$)|\.m3u8(\?|$)/i.test(url)
-      ) {
+      if (/mux\.com|\.mp4(\?|$)|\.webm(\?|$)/i.test(url)) {
         mediaRequests.push({
           t_ms: Date.now() - requestStart,
           method: req.method(),
-          url: url.slice(0, 150),
-          resourceType: req.resourceType(),
+          url: url.slice(0, 140),
         });
       }
     });
@@ -299,23 +380,19 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
         mediaRequests.push({
           t_ms: Date.now() - requestStart,
           failed: true,
-          url: url.slice(0, 150),
+          url: url.slice(0, 140),
           failure: req.failure()?.errorText,
         });
       }
     });
 
-    // Arm autoplay-hardening BEFORE navigation so it runs on document creation.
-    await page.addInitScript(AUTOPLAY_INIT);
+    await page.addInitScript(INIT_SCRIPT);
 
     console.log(`[${jobId}] navigating`);
     await page.goto(storybookUrl, { waitUntil: 'load', timeout: 30000 });
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-    // Count pages. Primary source: Studeo's __NEXT_DATA__ SSR payload
-    // (data.squirrel.number_of_pages). Fallback: DOM count of .page / [data-name]
-    // nodes. React hydration rearranges the DOM so a naive .page count can
-    // return 1 even for a 10-page book — hence the NEXT_DATA primary path.
+    // Page count from __NEXT_DATA__ (reliable), DOM fallback
     const pageCount = await page.evaluate(() => {
       try {
         const el = document.getElementById('__NEXT_DATA__');
@@ -333,32 +410,26 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
       throw new Error(`BOOK_TOO_SHORT: only ${pageCount} pages (need >=5)`);
     }
 
-    // Focus the document without clicking the body (body click throws viewport errors).
+    // Focus + user activation
     await page.evaluate(() => {
       try {
         window.focus();
         if (document.body && document.body.focus) document.body.focus();
       } catch {}
     });
-
-    // User activation for Chromium autoplay policy.
-    // A real mouse click in the middle of the viewport generates a pointer event,
-    // which is the strongest signal to the browser that a user is present.
-    // Tab kept as a second belt-and-suspenders gesture. Studeo's own player's
-    // .play() calls still need this activation to be allowed by Chromium.
     await page.mouse.click(960, 540);
     await page.waitForTimeout(200);
     await page.keyboard.press('Tab');
     await page.waitForTimeout(300);
 
-    // Buffer time: let Studeo's library.js finish its init and start attempting
-    // to load cinemagraphs on its own. No interference from us.
+    // Let Studeo's library.js inject <video> elements + our route warm up.
     await page.waitForTimeout(1500);
 
-    // Helper to snapshot DOM state at the current choreography moment.
     const snap = async (label) => {
       try {
-        await page.evaluate(`window.__snap && window.__snap(${JSON.stringify(label)})`);
+        await page.evaluate(
+          `window.__snap && window.__snap(${JSON.stringify(label)})`
+        );
       } catch {}
     };
 
@@ -388,43 +459,23 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
 
     const choreoEndMs = Date.now();
 
-    // Read back collected diagnostics + run the Mux fetch test before teardown.
-    // The fetch test proves/disproves whether the network path to Mux works
-    // independently of <video> element decoding.
     try {
-      log.codecs = await page.evaluate(() => window.__diag && window.__diag.codecs);
-      log.codecError = await page.evaluate(() => window.__diag && window.__diag.codecError);
-      log.wrapError = await page.evaluate(() => window.__diag && window.__diag.wrapError);
-      log.calls = await page.evaluate(() => window.__diag && window.__diag.calls);
-      log.snapshots = await page.evaluate(() => window.__diag && window.__diag.snaps);
-      // Pull any Mux URL we saw attempted, fetch() it manually to separate
-      // network from codec issues.
-      const sampleMuxUrl =
-        (mediaRequests.find((r) => r.url && r.url.includes('mux.com')) || {}).url;
-      if (sampleMuxUrl) {
-        log.fetchTest = await page.evaluate(
-          (url) => window.__testMuxFetch(url),
-          sampleMuxUrl
-        );
-        log.fetchTestUrl = sampleMuxUrl.slice(0, 80);
-      }
+      log.codecs = await page.evaluate(() => window.__diag?.codecs);
+      log.snapshots = await page.evaluate(() => window.__diag?.snaps);
     } catch (e) {
       log.diagReadError = e.message;
     }
     log.mediaRequests = mediaRequests;
 
-    // Close CDP connection; recording is server-side and finalizes on stop.
     try { await browser.close(); } catch {}
     browser = null;
-
-    // Stop session so recording is flushed + uploaded.
     try { await hb.sessions.stop(session.id); } catch (e) {
       console.warn(`[${jobId}] stop warn: ${e.message}`);
     }
 
     const trimStart = Math.max(
       0,
-      (choreoStartMs - sessionStartMs) / 1000 - 0.2 // 0.2s cushion before cover dwell
+      (choreoStartMs - sessionStartMs) / 1000 - 0.2
     );
     const trimDuration = (choreoEndMs - choreoStartMs) / 1000;
     log.trimStart = Number(trimStart.toFixed(2));
@@ -445,7 +496,6 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     log.duration = Number(duration.toFixed(1));
     log.size = st.size;
 
-    // Ogre thresholds
     const DUR_MIN = 13.5;
     const DUR_MAX = 17.0;
     const SIZE_MIN = 200 * 1024;
@@ -472,10 +522,13 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
   } finally {
     if (browser) { try { await browser.close(); } catch {} }
     if (session) { try { await hb.sessions.stop(session.id); } catch {} }
+    fs.rm(path.join(CINEMAGRAPHS_DIR, jobId), { recursive: true, force: true }).catch(() => {});
   }
 }
 
-// ---------- express ----------
+// ========================================================
+//  Express
+// ========================================================
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -501,8 +554,8 @@ app.post('/render-preview', async (req, res) => {
   }
   const jobId = sanitizeJobId(storybookId);
 
-  await ensurePreviewsDir();
-  cleanupOldPreviews().catch(() => {});
+  await ensureDirs();
+  cleanupOldFiles().catch(() => {});
 
   const attempts = [];
   let success = null;
@@ -541,7 +594,7 @@ app.post('/render-preview', async (req, res) => {
   });
 });
 
-await ensurePreviewsDir();
+await ensureDirs();
 
 app.listen(PORT, () => {
   console.log(`studeo-preview-worker listening on ${PORT}`);
