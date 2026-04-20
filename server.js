@@ -118,7 +118,7 @@ async function renderOnce(storybookUrl) {
 
   // Poll for MP4
   for (let i = 0; i < 45; i++) {
-    const r = await hb.sessions.videoRecording.retrieve(session.id);
+    const r = await hb.sessions.getVideoRecordingURL(session.id);;
     if (r.status === 'completed' && r.recordingUrl) {
       return { mp4Url: r.recordingUrl, sessionId: session.id, pageCount };
     }
