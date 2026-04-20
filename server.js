@@ -126,32 +126,122 @@ async function pollVideoUrl(sessionId, timeoutMs = 120000) {
 // allows them and so Studeo's player's internal .play() call succeeds.
 const AUTOPLAY_INIT = `
 (() => {
-  // --- diagnostic collector (global, accumulates across choreography) ---
-  window.__diag = { snaps: [], t0: Date.now() };
+  // Diagnostic collector + media-method tracer.
+  // We are NO LONGER interfering with Studeo's player. Just observing.
+  // This isolates whether the ERR_ABORTED cascade is coming from our code,
+  // Studeo's library.js, or somewhere else.
+  window.__diag = { snaps: [], calls: [], t0: Date.now(), wrapError: null };
+
+  // CODEC CAPABILITY PROBE — the critical test. Playwright's bundled Chromium
+  // typically lacks H.264 (MPEG-4 AVC) because of patent encumbrance. If
+  // canPlayType returns "" for avc1.* codecs, we've found the root cause of
+  // the ~80ms ERR_ABORTED pattern: Chrome fetches headers, detects unsupported
+  // codec, aborts. Studeo retries every 4s, same result. Infinite loop.
+  try {
+    const probe = document.createElement('video');
+    window.__diag.codecs = {
+      mp4_generic: probe.canPlayType('video/mp4'),
+      h264_baseline: probe.canPlayType('video/mp4; codecs="avc1.42E01E"'),
+      h264_main: probe.canPlayType('video/mp4; codecs="avc1.4D401F"'),
+      h264_high: probe.canPlayType('video/mp4; codecs="avc1.64001F"'),
+      aac: probe.canPlayType('audio/mp4; codecs="mp4a.40.2"'),
+      webm_vp8: probe.canPlayType('video/webm; codecs="vp8"'),
+      webm_vp9: probe.canPlayType('video/webm; codecs="vp9"'),
+      av1: probe.canPlayType('video/mp4; codecs="av01.0.04M.08"'),
+    };
+  } catch (e) {
+    window.__diag.codecError = e.message;
+  }
+
+  // Manual fetch test — confirms whether the network path to Mux works at all
+  // (i.e., CORS, DNS, connectivity). If fetch() returns 200 but <video> aborts,
+  // the issue is codec decode, not network.
+  window.__testMuxFetch = async (url) => {
+    try {
+      const resp = await fetch(url, { method: 'GET', mode: 'cors' });
+      const reader = resp.body.getReader();
+      const first = await reader.read();
+      reader.cancel();
+      return {
+        ok: resp.ok,
+        status: resp.status,
+        type: resp.type,
+        contentType: resp.headers.get('content-type'),
+        contentLength: resp.headers.get('content-length'),
+        firstBytes: first.value ? first.value.byteLength : 0,
+      };
+    } catch (e) {
+      return { err: e.message };
+    }
+  };
+
+  const logCall = (method, el, extra) => {
+    try {
+      window.__diag.calls.push({
+        m: method,
+        t_ms: Date.now() - window.__diag.t0,
+        src: (el.currentSrc || el.src || '').slice(-50),
+        ns: el.networkState,
+        rs: el.readyState,
+        ...(extra || {}),
+      });
+    } catch {}
+  };
+
+  // Wrap HTMLMediaElement.prototype.load — this is the usual culprit for ABORT.
+  try {
+    const proto = HTMLMediaElement.prototype;
+    const origLoad = proto.load;
+    proto.load = function () {
+      logCall('load', this);
+      return origLoad.apply(this, arguments);
+    };
+    const origPause = proto.pause;
+    proto.pause = function () {
+      logCall('pause', this);
+      return origPause.apply(this, arguments);
+    };
+    const origPlay = proto.play;
+    proto.play = function () {
+      logCall('play', this);
+      return origPlay.apply(this, arguments);
+    };
+    // Wrap the src setter so we see every assignment (including resets to '').
+    const srcDesc = Object.getOwnPropertyDescriptor(proto, 'src');
+    if (srcDesc && srcDesc.configurable) {
+      Object.defineProperty(proto, 'src', {
+        configurable: true,
+        get: srcDesc.get,
+        set: function (v) {
+          logCall('set src', this, { to: String(v).slice(-60) });
+          return srcDesc.set.call(this, v);
+        },
+      });
+    }
+  } catch (e) {
+    window.__diag.wrapError = e.message;
+  }
+
   window.__snap = (label) => {
     try {
       window.__diag.snaps.push({
         label,
         t_ms: Date.now() - window.__diag.t0,
         videos: [...document.querySelectorAll('video')].map((v) => ({
-          src: (v.currentSrc || v.src || '').slice(0, 120),
+          src: (v.currentSrc || v.src || '').slice(0, 100),
           paused: v.paused,
-          ended: v.ended,
           muted: v.muted,
           readyState: v.readyState,
           networkState: v.networkState,
           ct: Number((v.currentTime || 0).toFixed(2)),
-          dur: Number((v.duration || 0).toFixed(2)) || null,
           w: v.videoWidth,
           h: v.videoHeight,
           err: v.error ? v.error.code : null,
+          crossOrigin: v.crossOrigin,
+          preload: v.preload,
+          attrs: [...v.attributes].map((a) => a.name + '=' + a.value.slice(0, 40)).slice(0, 8),
         })),
-        slots: [...document.querySelectorAll('[id="image1"], [id="image2"]')].map((s) => ({
-          id: s.id,
-          childTags: [...s.children].map((c) => c.tagName.toLowerCase()).slice(0, 6),
-          inner: (s.innerHTML || '').slice(0, 400),
-        })),
-        activePage: (document.querySelector('.page[data-name]') || {}).getAttribute
+        activePage: document.querySelector('.page[data-name]')
           ? document.querySelector('.page[data-name]').getAttribute('data-name')
           : null,
       });
@@ -159,65 +249,9 @@ const AUTOPLAY_INIT = `
       window.__diag.snaps.push({ label, error: e.message });
     }
   };
-
-  // --- video autoplay hardening ---
-  const configure = (v) => {
-    try {
-      v.muted = true;
-      v.defaultMuted = true;
-      v.autoplay = true;
-      v.loop = true;
-      v.playsInline = true;
-      v.setAttribute('muted', '');
-      v.setAttribute('autoplay', '');
-      v.setAttribute('loop', '');
-      v.setAttribute('playsinline', '');
-      const kick = () => {
-        try {
-          const p = v.play();
-          if (p && p.catch) p.catch(() => {});
-        } catch {}
-      };
-      if (v.readyState >= 2) kick();
-      else v.addEventListener('loadeddata', kick, { once: true });
-      v.addEventListener('pause', () => setTimeout(kick, 50));
-    } catch {}
-  };
-  const scan = (root) => {
-    try {
-      if (root.nodeType === 1 && root.tagName === 'VIDEO') configure(root);
-      root.querySelectorAll && root.querySelectorAll('video').forEach(configure);
-    } catch {}
-  };
-  const mo = new MutationObserver((muts) => {
-    for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) scan(n);
-  });
-  const start = () => {
-    scan(document);
-    mo.observe(document.documentElement, { childList: true, subtree: true });
-    setInterval(() => {
-      try {
-        document.querySelectorAll('video').forEach((v) => {
-          if (v.paused || v.ended) {
-            try {
-              v.muted = true;
-              const p = v.play();
-              if (p && p.catch) p.catch(() => {});
-            } catch {}
-          }
-        });
-      } catch {}
-    }, 1000);
-  };
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start);
-  } else {
-    start();
-  }
 })();
 `;
 
-// No longer used — snapshots happen during choreography instead.
 const DIAGNOSTIC_PROBE = '(() => ({deprecated: true}))()';
 
 // ---------- one render attempt ----------
@@ -310,23 +344,15 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     // User activation for Chromium autoplay policy.
     // A real mouse click in the middle of the viewport generates a pointer event,
     // which is the strongest signal to the browser that a user is present.
-    // Tab kept as a second belt-and-suspenders gesture.
+    // Tab kept as a second belt-and-suspenders gesture. Studeo's own player's
+    // .play() calls still need this activation to be allowed by Chromium.
     await page.mouse.click(960, 540);
     await page.waitForTimeout(200);
     await page.keyboard.press('Tab');
     await page.waitForTimeout(300);
 
-    // Force-play every video now that we have user activation.
-    await page.evaluate(() => {
-      document.querySelectorAll('video').forEach((v) => {
-        try {
-          v.muted = true;
-          const p = v.play();
-          if (p && p.catch) p.catch(() => {});
-        } catch {}
-      });
-    });
-    // Give videos real time to buffer + start playing before we begin choreography.
+    // Buffer time: let Studeo's library.js finish its init and start attempting
+    // to load cinemagraphs on its own. No interference from us.
     await page.waitForTimeout(1500);
 
     // Helper to snapshot DOM state at the current choreography moment.
@@ -362,11 +388,28 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
 
     const choreoEndMs = Date.now();
 
-    // Read back collected diagnostics before tearing down the browser.
+    // Read back collected diagnostics + run the Mux fetch test before teardown.
+    // The fetch test proves/disproves whether the network path to Mux works
+    // independently of <video> element decoding.
     try {
+      log.codecs = await page.evaluate(() => window.__diag && window.__diag.codecs);
+      log.codecError = await page.evaluate(() => window.__diag && window.__diag.codecError);
+      log.wrapError = await page.evaluate(() => window.__diag && window.__diag.wrapError);
+      log.calls = await page.evaluate(() => window.__diag && window.__diag.calls);
       log.snapshots = await page.evaluate(() => window.__diag && window.__diag.snaps);
+      // Pull any Mux URL we saw attempted, fetch() it manually to separate
+      // network from codec issues.
+      const sampleMuxUrl =
+        (mediaRequests.find((r) => r.url && r.url.includes('mux.com')) || {}).url;
+      if (sampleMuxUrl) {
+        log.fetchTest = await page.evaluate(
+          (url) => window.__testMuxFetch(url),
+          sampleMuxUrl
+        );
+        log.fetchTestUrl = sampleMuxUrl.slice(0, 80);
+      }
     } catch (e) {
-      log.snapshots = { error: e.message };
+      log.diagReadError = e.message;
     }
     log.mediaRequests = mediaRequests;
 
