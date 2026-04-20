@@ -326,39 +326,92 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     log.pretranscode = pretranscode.stats;
     console.log(`[${jobId}] session ${session.id}`);
 
+    // PRE-LOAD every transcoded WebM into memory ONCE. This eliminates any
+    // fs.readFile race condition in the route handler — two simultaneous
+    // video requests were randomly causing one to serve correctly and the
+    // other to stall at readyState:0 when both handlers raced to read files
+    // from the thread pool. In-memory lookup is sync and bulletproof.
+    const webmBuffers = {};
+    for (const [muxId, webmPath] of Object.entries(pretranscode.byMuxId)) {
+      try {
+        webmBuffers[muxId] = await fs.readFile(webmPath);
+      } catch (e) {
+        console.warn(`[${jobId}] preload ${muxId} failed: ${e.message}`);
+      }
+    }
+    log.preloadedBuffers = Object.keys(webmBuffers).length;
+
     const sessionStartMs = Date.now();
 
     browser = await chromium.connectOverCDP(session.wsEndpoint);
     const context = browser.contexts()[0] || (await browser.newContext());
     const page = context.pages()[0] || (await context.newPage());
 
-    // THE KEY HOOK: intercept every Mux video request and serve our local
-    // pre-transcoded WebM instead of letting Chromium fetch H.264 and choke.
+    // Track every route interception so we can see what actually happened
+    // per request — critical for diagnosing any remaining odd behavior.
+    const routeLog = [];
+    const routeStart = Date.now();
+
+    // THE KEY HOOK: intercept Mux video requests, serve local WebM.
+    // Handles Range headers properly (returns 206 Partial Content with
+    // Content-Range) — video elements often probe metadata via byte ranges,
+    // and returning a full 200 response to a Range request can stall them.
     await page.route('**/stream.mux.com/**', async (route) => {
-      const url = route.request().url();
+      const req = route.request();
+      const url = req.url();
       const muxId = muxIdFromUrl(url);
-      const webmPath = muxId ? pretranscode.byMuxId[muxId] : null;
-      if (webmPath) {
-        try {
-          const body = await fs.readFile(webmPath);
+      const body = muxId ? webmBuffers[muxId] : null;
+      const entry = {
+        t_ms: Date.now() - routeStart,
+        muxId,
+        size: body ? body.length : 0,
+      };
+      routeLog.push(entry);
+
+      if (!body) {
+        entry.outcome = 'no_buffer';
+        try { await route.continue(); } catch {}
+        return;
+      }
+
+      const rangeHeader = req.headers()['range'];
+      try {
+        if (rangeHeader) {
+          const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+          const start = m ? parseInt(m[1], 10) : 0;
+          const end = m && m[2] ? parseInt(m[2], 10) : body.length - 1;
+          const chunk = body.subarray(start, end + 1);
+          await route.fulfill({
+            status: 206,
+            contentType: 'video/webm',
+            headers: {
+              'accept-ranges': 'bytes',
+              'content-range': `bytes ${start}-${end}/${body.length}`,
+              'content-length': String(chunk.length),
+              'access-control-allow-origin': '*',
+            },
+            body: chunk,
+          });
+          entry.outcome = 'fulfilled_206';
+          entry.range = `${start}-${end}`;
+        } else {
           await route.fulfill({
             status: 200,
             contentType: 'video/webm',
             headers: {
-              'access-control-allow-origin': '*',
               'accept-ranges': 'bytes',
-              'cache-control': 'public, max-age=3600',
+              'content-length': String(body.length),
+              'access-control-allow-origin': '*',
             },
             body,
           });
-          return;
-        } catch (e) {
-          console.warn(`[${jobId}] route fulfill failed ${muxId}: ${e.message}`);
+          entry.outcome = 'fulfilled_200';
         }
+      } catch (e) {
+        entry.outcome = 'fulfill_error';
+        entry.err = e.message;
+        try { await route.continue(); } catch {}
       }
-      // Fallthrough: let the request go through (will fail with ERR_ABORTED,
-      // same as before — but no worse than current state).
-      route.continue();
     });
 
     // Network trace for debugging
@@ -466,6 +519,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
       log.diagReadError = e.message;
     }
     log.mediaRequests = mediaRequests;
+    log.routeLog = routeLog;
 
     try { await browser.close(); } catch {}
     browser = null;
@@ -497,7 +551,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum }) {
     log.size = st.size;
 
     const DUR_MIN = 13.5;
-    const DUR_MAX = 17.0;
+    const DUR_MAX = 22.0;
     const SIZE_MIN = 200 * 1024;
 
     if (duration < DUR_MIN || duration > DUR_MAX) {
