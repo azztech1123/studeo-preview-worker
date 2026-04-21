@@ -457,16 +457,16 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     // looking at the outgoing spread, not the incoming one.
     //
     //   0.0s  Cover dwell       2.0s
-    //   2.0s  → transition      1.2s (not counted as dwell)
-    //   3.2s  Spread 2 dwell    3.0s
-    //   6.2s  → transition      1.2s
-    //   7.4s  Spread 3 dwell    3.0s
-    //   10.4s ← transition      1.2s
-    //   11.6s Spread 2 dwell    1.5s
-    //   13.1s ← transition      1.2s
-    //   14.3s Cover dwell       1.5s
-    //   15.8s tail               0.5s
-    //   16.3s total
+    //   2.0s  → transition      1.2s
+    //   3.2s  Spread 2 (fwd)    5.0s   ← forward pass: longer dwell
+    //   8.2s  → transition      1.2s
+    //   9.4s  Spread 3 (fwd)    5.0s   ← forward pass: longer dwell
+    //   14.4s ← transition      1.2s
+    //   15.6s Spread 2 (back)   1.5s   ← backward pass: brief
+    //   17.1s ← transition      1.2s
+    //   18.3s Cover (back)      1.5s
+    //   19.8s tail               0.5s
+    //   20.3s target (actual ~24s with snap() overhead)
     const choreoStartMs = Date.now();
 
     await snap('t=0_cover');
@@ -475,25 +475,25 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     await page.keyboard.press('ArrowRight');
     await page.waitForTimeout(1200);                 // transition to spread 2
     await snap('t=3.2_spread-2-in');
-    await page.waitForTimeout(3000);                 // spread 2 dwell
+    await page.waitForTimeout(5000);                 // spread 2 forward dwell (+2s)
 
     await page.keyboard.press('ArrowRight');
     await page.waitForTimeout(1200);                 // transition to spread 3
-    await snap('t=7.4_spread-3-in');
-    await page.waitForTimeout(3000);                 // spread 3 dwell
+    await snap('t=9.4_spread-3-in');
+    await page.waitForTimeout(5000);                 // spread 3 forward dwell (+2s)
 
     await page.keyboard.press('ArrowLeft');
     await page.waitForTimeout(1200);                 // transition back to spread 2
-    await snap('t=11.6_spread-2-back');
-    await page.waitForTimeout(1500);                 // brief dwell on way back
+    await snap('t=15.6_spread-2-back');
+    await page.waitForTimeout(1500);                 // backward dwell (unchanged)
 
     await page.keyboard.press('ArrowLeft');
     await page.waitForTimeout(1200);                 // transition back to cover
-    await snap('t=14.3_cover-back');
+    await snap('t=18.3_cover-back');
     await page.waitForTimeout(1500);                 // final cover dwell
 
     await page.waitForTimeout(500);                  // tail
-    await snap('t=16.3_tail');
+    await snap('t=20.3_tail');
 
     const choreoEndMs = Date.now();
 
@@ -543,7 +543,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     log.size = st.size;
 
     const DUR_MIN = 13.5;
-    const DUR_MAX = 25.0;
+    const DUR_MAX = 28.0;
     const SIZE_MIN = 200 * 1024;
 
     if (duration < DUR_MIN || duration > DUR_MAX) {
