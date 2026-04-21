@@ -633,7 +633,89 @@ app.get('/webm/:jobId/:muxId.webm', (req, res) => {
   }
 });
 
+// ========================================================
+//  Async job state (shared by short and long modes)
+// ========================================================
+const JOB_STATE = new Map(); // jobId -> state object
+const JOB_TTL_MS = 24 * 60 * 60 * 1000;
+
+function sweepJobState() {
+  const now = Date.now();
+  for (const [id, state] of JOB_STATE.entries()) {
+    if (now - state.updatedAt > JOB_TTL_MS) JOB_STATE.delete(id);
+  }
+}
+setInterval(sweepJobState, 60 * 60 * 1000).unref();
+
+// ========================================================
+//  v15b short-mode implementation (UNCHANGED from proven version)
+// ========================================================
+
+async function runRenderJob({ jobId, storybookUrl, baseUrl }) {
+  const state = JOB_STATE.get(jobId);
+  state.status = 'running';
+  state.updatedAt = Date.now();
+
+  try {
+    await ensureDirs();
+    cleanupOldFiles().catch(() => {});
+
+    const attempts = [];
+    let success = null;
+    let rawVideoUrl = null;
+
+    for (let i = 1; i <= 3; i++) {
+      const result = await runOneAttempt({
+        storybookUrl,
+        jobId,
+        attemptNum: i,
+        baseUrl,
+      });
+      attempts.push(result.log);
+      if (result.ok) {
+        success = result;
+        rawVideoUrl = result.rawVideoUrl;
+        break;
+      }
+      if (result.fatal) {
+        state.status = 'failed';
+        state.error = result.log.reason;
+        state.attempts = attempts;
+        state.updatedAt = Date.now();
+        return;
+      }
+    }
+
+    if (!success) {
+      state.status = 'failed';
+      state.error = 'all attempts failed';
+      state.attempts = attempts;
+      state.updatedAt = Date.now();
+      return;
+    }
+
+    const st = await fs.stat(success.outPath);
+    state.status = 'completed';
+    state.mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
+    state.rawMp4Url = rawVideoUrl;
+    state.pageCount = success.log.pageCount;
+    state.duration = success.log.duration;
+    state.sizeBytes = st.size;
+    state.attempts = attempts;
+    state.updatedAt = Date.now();
+  } catch (err) {
+    state.status = 'failed';
+    state.error = err?.message || 'unknown error';
+    state.updatedAt = Date.now();
+    console.error(`[${jobId}] render job crashed:`, err);
+  }
+}
+
 app.post('/render-preview', async (req, res) => {
+  // Dispatch to long-mode handler if requested
+  if ((req.body || {}).version === 'long') return handleLongSyncRender(req, res);
+
+  // ↓↓↓ v15b code from here, byte-for-byte unchanged ↓↓↓
   const { storybookUrl, storybookId } = req.body || {};
   if (!storybookUrl || typeof storybookUrl !== 'string') {
     return res.status(400).json({ error: 'storybookUrl required' });
@@ -682,7 +764,509 @@ app.post('/render-preview', async (req, res) => {
   });
 });
 
+app.post('/render-preview-async', async (req, res) => {
+  // Dispatch to long-mode handler if requested
+  if ((req.body || {}).version === 'long') return handleLongAsyncRender(req, res);
+
+  // ↓↓↓ v15b code from here, byte-for-byte unchanged ↓↓↓
+  const { storybookUrl, storybookId } = req.body || {};
+  if (!storybookUrl || typeof storybookUrl !== 'string') {
+    return res.status(400).json({ error: 'storybookUrl required' });
+  }
+  const jobId = sanitizeJobId(storybookId);
+
+  const host = req.get('host');
+  const proto = req.get('x-forwarded-proto') || 'https';
+  const baseUrl = `${proto}://${host}`;
+
+  // If this jobId is already running/completed, return its current state
+  // rather than starting a new render — enables idempotency retries.
+  const existing = JOB_STATE.get(jobId);
+  if (existing && (existing.status === 'pending' || existing.status === 'running')) {
+    return res.status(202).json({
+      jobId,
+      statusUrl: `${baseUrl}/preview-status/${jobId}`,
+      status: existing.status,
+      note: 'already in progress',
+    });
+  }
+
+  const state = {
+    jobId,
+    status: 'pending',
+    storybookUrl,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  JOB_STATE.set(jobId, state);
+
+  // Fire and forget — runs after the response is sent.
+  setImmediate(() => {
+    runRenderJob({ jobId, storybookUrl, baseUrl }).catch((err) => {
+      console.error(`[${jobId}] runRenderJob threw:`, err);
+    });
+  });
+
+  res.status(202).json({
+    jobId,
+    statusUrl: `${baseUrl}/preview-status/${jobId}`,
+    status: 'pending',
+  });
+});
+
+app.get('/preview-status/:jobId', (req, res) => {
+  const jobId = sanitizeJobId(req.params.jobId);
+  const state = JOB_STATE.get(jobId);
+  if (!state) {
+    return res.status(404).json({
+      jobId,
+      status: 'unknown',
+      error: 'no job with that id (may have expired or never existed)',
+    });
+  }
+  // Return a clean view — omit storybookUrl and attempts log from status for brevity
+  const { storybookUrl: _omit1, attempts: _omit2, ...clean } = state;
+  res.json(clean);
+});
+
 await ensureDirs();
+
+// ============================================================================
+//  ██  LONG-MODE ADDITIONS — PURELY ADDITIVE, DOES NOT TOUCH v15b CODE  ██
+// ============================================================================
+//
+//  Triggered by {version: "long"} in the POST body of either /render-preview
+//  or /render-preview-async. Dispatched via a single-line branch inserted at
+//  the top of each v15b endpoint (see above).
+//
+//  Choreography: cover → fwd through entire book → idle on last spread, 42s.
+//  Spread count S = min(floor((pageCount - 2) / 2), 5). Books with more than
+//  5 interior spreads are truncated to 5 with a truncated:true flag in the
+//  response.
+//
+//  Shares with v15b:
+//    - JOB_STATE map (for async status lookups via /preview-status/:jobId)
+//    - All infrastructure: pretranscoding, Mux→WebM 302 redirects,
+//      /webm/* endpoint, /previews/* endpoint, trim math, ffprobe/ffmpeg
+//
+//  Does not share with v15b:
+//    - Choreography (different flow)
+//    - Validator bounds (40-44s instead of 13.5-28s)
+//    - Attempt runner (runFullForwardAttempt vs runOneAttempt)
+//    - Job runner (runLongRenderJob vs runRenderJob)
+//    - Handler bodies (handleLongSyncRender vs inline v15b handler)
+// ============================================================================
+
+async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
+  let session = null;
+  let browser = null;
+  const log = { attempt: attemptNum, version: 'long' };
+
+  try {
+    console.log(`[${jobId}] LONG attempt ${attemptNum}: creating session + pretranscoding in parallel`);
+
+    const [sessionResult, pretranscode] = await Promise.all([
+      hb.sessions.create({
+        enableWebRecording: true,
+        enableVideoWebRecording: true,
+        screen: { width: 1920, height: 1080 },
+      }),
+      pretranscodeCinemagraphs(storybookUrl, jobId),
+    ]);
+    session = sessionResult;
+    log.sessionId = session.id;
+    log.pretranscode = pretranscode.stats;
+    console.log(`[${jobId}] LONG session ${session.id}`);
+
+    browser = await chromium.connectOverCDP(session.wsEndpoint);
+    const context = browser.contexts()[0] || (await browser.newContext());
+    const page = context.pages()[0] || (await context.newPage());
+
+    const routeLog = [];
+    const routeStart = Date.now();
+
+    // Same 302 redirect architecture as v15b
+    await page.route('**/stream.mux.com/**', async (route) => {
+      const url = route.request().url();
+      const muxId = muxIdFromUrl(url);
+      const entry = { t_ms: Date.now() - routeStart, muxId };
+      routeLog.push(entry);
+
+      if (muxId && pretranscode.byMuxId[muxId]) {
+        const redirectUrl = `${baseUrl}/webm/${encodeURIComponent(jobId)}/${encodeURIComponent(muxId)}.webm`;
+        try {
+          await route.fulfill({
+            status: 302,
+            headers: {
+              location: redirectUrl,
+              'access-control-allow-origin': '*',
+            },
+          });
+          entry.outcome = 'redirected';
+          entry.redirectTo = redirectUrl;
+          return;
+        } catch (e) {
+          entry.outcome = 'redirect_error';
+          entry.err = e.message;
+        }
+      } else {
+        entry.outcome = 'no_match';
+      }
+      try { await route.continue(); } catch {}
+    });
+
+    const mediaRequests = [];
+    const requestStart = Date.now();
+    page.on('request', (req) => {
+      const url = req.url();
+      if (/mux\.com|\.mp4(\?|$)|\.webm(\?|$)/i.test(url)) {
+        mediaRequests.push({
+          t_ms: Date.now() - requestStart,
+          method: req.method(),
+          url: url.slice(0, 140),
+        });
+      }
+    });
+    page.on('requestfailed', (req) => {
+      const url = req.url();
+      if (/mux\.com|\.mp4(\?|$)|\.webm(\?|$)/i.test(url)) {
+        mediaRequests.push({
+          t_ms: Date.now() - requestStart,
+          failed: true,
+          url: url.slice(0, 140),
+          failure: req.failure()?.errorText,
+        });
+      }
+    });
+
+    await page.addInitScript(INIT_SCRIPT);
+
+    console.log(`[${jobId}] LONG navigating`);
+    await page.goto(storybookUrl, { waitUntil: 'load', timeout: 30000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+    const pageCount = await page.evaluate(() => {
+      try {
+        const el = document.getElementById('__NEXT_DATA__');
+        if (el) {
+          const j = JSON.parse(el.textContent || '{}');
+          const n = j?.props?.pageProps?.data?.squirrel?.number_of_pages;
+          if (typeof n === 'number' && n > 0) return n;
+        }
+      } catch {}
+      return document.querySelectorAll('.page, [data-name]').length;
+    });
+    log.pageCount = pageCount;
+
+    if (pageCount < 4) {
+      throw new Error(`BOOK_TOO_SHORT: ${pageCount} pages yields no interior spreads (need >=4)`);
+    }
+
+    await page.evaluate(() => {
+      try {
+        window.focus();
+        if (document.body && document.body.focus) document.body.focus();
+      } catch {}
+    });
+    await page.mouse.click(960, 540);
+    await page.waitForTimeout(200);
+    await page.keyboard.press('Tab');
+    await page.waitForTimeout(300);
+
+    await page.waitForTimeout(2500);
+
+    const snap = async (label) => {
+      try {
+        await page.evaluate(
+          `window.__snap && window.__snap(${JSON.stringify(label)})`
+        );
+      } catch {}
+    };
+
+    // === LONG-MODE CHOREOGRAPHY ===
+    // 42s total target:
+    //   t=0.0   Cover dwell 2s
+    //   t=2.0   press ArrowRight → transition 1.2s
+    //   t=3.2   Spread 1 dwell 6s
+    //   ... (repeat per spread, each flip + dwell = 7.2s)
+    //   t=3.2 + S*7.2   Last spread reached, start idle
+    //   t=42.0          End
+    //
+    // S = min(floor((pageCount - 2) / 2), 5)
+    // Idle is computed from WALL CLOCK so snap() overhead can't push past 42s.
+    const TARGET_MS = 42000;
+    const COVER_DWELL = 2000;
+    const TRANSITION = 1200;
+    const SPREAD_DWELL = 6000;
+    const MAX_SPREADS = 5;
+
+    const interiorSpreadsTotal = Math.floor((pageCount - 2) / 2);
+    const spreadsShown = Math.min(interiorSpreadsTotal, MAX_SPREADS);
+    const truncated = interiorSpreadsTotal > MAX_SPREADS;
+
+    log.spreadsShown = spreadsShown;
+    log.spreadsTotal = interiorSpreadsTotal;
+    log.truncated = truncated;
+    log.targetMs = TARGET_MS;
+
+    const choreoStartMs = Date.now();
+
+    await snap('t=0_cover');
+    await page.waitForTimeout(COVER_DWELL);
+
+    for (let i = 1; i <= spreadsShown; i++) {
+      await page.keyboard.press('ArrowRight');
+      await page.waitForTimeout(TRANSITION);
+      if (i === 1 || i === spreadsShown) {
+        await snap(`t_approx_spread-${i}-in`);
+      }
+      await page.waitForTimeout(SPREAD_DWELL);
+    }
+
+    // Idle from wall clock
+    const forwardElapsed = Date.now() - choreoStartMs;
+    const remaining = TARGET_MS - forwardElapsed;
+    log.forwardPassMs = forwardElapsed;
+    log.idleOnLastMs = Math.max(0, remaining);
+    if (remaining > 100) {
+      await page.waitForTimeout(remaining);
+    }
+    await snap('t=end_idle');
+
+    const choreoEndMs = Date.now();
+
+    try {
+      log.codecs = await page.evaluate(() => window.__diag?.codecs);
+      log.snapshots = await page.evaluate(() => window.__diag?.snaps);
+    } catch (e) {
+      log.diagReadError = e.message;
+    }
+    log.mediaRequests = mediaRequests;
+    log.routeLog = routeLog;
+
+    try { await browser.close(); } catch {}
+    browser = null;
+    try { await hb.sessions.stop(session.id); } catch (e) {
+      console.warn(`[${jobId}] LONG stop warn: ${e.message}`);
+    }
+
+    const trimDuration = (choreoEndMs - choreoStartMs) / 1000;
+    log.trimDuration = Number(trimDuration.toFixed(2));
+
+    console.log(`[${jobId}] LONG polling for recording url`);
+    const rawVideoUrl = await pollVideoUrl(session.id);
+
+    const rawPath = path.join(PREVIEWS_DIR, `${jobId}_raw.mp4`);
+    await downloadToFile(rawVideoUrl, rawPath);
+
+    const rawDuration = await probeDuration(rawPath);
+    log.rawDuration = Number(rawDuration.toFixed(2));
+    const tailCushion = 0.3;
+    const trimStart = Math.max(0, rawDuration - trimDuration - tailCushion);
+    log.trimStart = Number(trimStart.toFixed(2));
+
+    const outPath = path.join(PREVIEWS_DIR, `${jobId}.mp4`);
+    await trimMp4(rawPath, outPath, trimStart, trimDuration);
+    await fs.unlink(rawPath).catch(() => {});
+
+    const duration = await probeDuration(outPath);
+    const st = await fs.stat(outPath);
+    log.duration = Number(duration.toFixed(1));
+    log.size = st.size;
+
+    // LONG-MODE validator: target ~42s
+    const DUR_MIN = 40.0;
+    const DUR_MAX = 44.0;
+    const SIZE_MIN = 200 * 1024;
+
+    if (duration < DUR_MIN || duration > DUR_MAX) {
+      log.pass = false;
+      log.reason = `duration=${duration.toFixed(1)}s out of [${DUR_MIN},${DUR_MAX}]`;
+      return { ok: false, log, outPath, rawVideoUrl };
+    }
+    if (st.size < SIZE_MIN) {
+      log.pass = false;
+      log.reason = `size=${st.size} below ${SIZE_MIN}`;
+      return { ok: false, log, outPath, rawVideoUrl };
+    }
+
+    log.pass = true;
+    log.reason = null;
+    return { ok: true, log, outPath, rawVideoUrl };
+  } catch (e) {
+    log.pass = false;
+    log.reason = e.message;
+    const fatal = e.message.startsWith('BOOK_TOO_SHORT');
+    return { ok: false, log, fatal, error: e };
+  } finally {
+    if (browser) { try { await browser.close(); } catch {} }
+    if (session) { try { await hb.sessions.stop(session.id); } catch {} }
+    fs.rm(path.join(CINEMAGRAPHS_DIR, jobId), { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function runLongRenderJob({ jobId, storybookUrl, baseUrl }) {
+  const state = JOB_STATE.get(jobId);
+  state.status = 'running';
+  state.updatedAt = Date.now();
+
+  try {
+    await ensureDirs();
+    cleanupOldFiles().catch(() => {});
+
+    const attempts = [];
+    let success = null;
+    let rawVideoUrl = null;
+
+    for (let i = 1; i <= 3; i++) {
+      const result = await runFullForwardAttempt({
+        storybookUrl,
+        jobId,
+        attemptNum: i,
+        baseUrl,
+      });
+      attempts.push(result.log);
+      if (result.ok) {
+        success = result;
+        rawVideoUrl = result.rawVideoUrl;
+        break;
+      }
+      if (result.fatal) {
+        state.status = 'failed';
+        state.error = result.log.reason;
+        state.attempts = attempts;
+        state.updatedAt = Date.now();
+        return;
+      }
+    }
+
+    if (!success) {
+      state.status = 'failed';
+      state.error = 'all attempts failed';
+      state.attempts = attempts;
+      state.updatedAt = Date.now();
+      return;
+    }
+
+    const st = await fs.stat(success.outPath);
+    state.status = 'completed';
+    state.version = 'long';
+    state.mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
+    state.rawMp4Url = rawVideoUrl;
+    state.pageCount = success.log.pageCount;
+    state.duration = success.log.duration;
+    state.sizeBytes = st.size;
+    state.spreadsShown = success.log.spreadsShown;
+    state.spreadsTotal = success.log.spreadsTotal;
+    state.truncated = success.log.truncated;
+    state.attempts = attempts;
+    state.updatedAt = Date.now();
+  } catch (err) {
+    state.status = 'failed';
+    state.error = err?.message || 'unknown error';
+    state.updatedAt = Date.now();
+    console.error(`[${jobId}] LONG render job crashed:`, err);
+  }
+}
+
+async function handleLongSyncRender(req, res) {
+  const { storybookUrl, storybookId } = req.body || {};
+  if (!storybookUrl || typeof storybookUrl !== 'string') {
+    return res.status(400).json({ error: 'storybookUrl required' });
+  }
+  const jobId = sanitizeJobId(storybookId);
+
+  await ensureDirs();
+  cleanupOldFiles().catch(() => {});
+
+  const attempts = [];
+  let success = null;
+  let rawVideoUrl = null;
+
+  const host = req.get('host');
+  const proto = req.get('x-forwarded-proto') || 'https';
+  const baseUrl = `${proto}://${host}`;
+
+  for (let i = 1; i <= 3; i++) {
+    const result = await runFullForwardAttempt({ storybookUrl, jobId, attemptNum: i, baseUrl });
+    attempts.push(result.log);
+    if (result.ok) {
+      success = result;
+      rawVideoUrl = result.rawVideoUrl;
+      break;
+    }
+    if (result.fatal) {
+      return res.status(422).json({ error: result.log.reason, attempts });
+    }
+  }
+
+  if (!success) {
+    return res.status(500).json({ error: 'all attempts failed', attempts });
+  }
+
+  const st = await fs.stat(success.outPath);
+  const mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
+
+  res.json({
+    mp4Url,
+    rawMp4Url: rawVideoUrl,
+    version: 'long',
+    pageCount: success.log.pageCount,
+    duration: success.log.duration,
+    sizeBytes: st.size,
+    spreadsShown: success.log.spreadsShown,
+    spreadsTotal: success.log.spreadsTotal,
+    truncated: success.log.truncated,
+    jobId,
+    attempts,
+  });
+}
+
+async function handleLongAsyncRender(req, res) {
+  const { storybookUrl, storybookId } = req.body || {};
+  if (!storybookUrl || typeof storybookUrl !== 'string') {
+    return res.status(400).json({ error: 'storybookUrl required' });
+  }
+  const jobId = sanitizeJobId(storybookId);
+
+  const host = req.get('host');
+  const proto = req.get('x-forwarded-proto') || 'https';
+  const baseUrl = `${proto}://${host}`;
+
+  const existing = JOB_STATE.get(jobId);
+  if (existing && (existing.status === 'pending' || existing.status === 'running')) {
+    return res.status(202).json({
+      jobId,
+      statusUrl: `${baseUrl}/preview-status/${jobId}`,
+      status: existing.status,
+      version: existing.version,
+      note: 'already in progress',
+    });
+  }
+
+  const state = {
+    jobId,
+    version: 'long',
+    status: 'pending',
+    storybookUrl,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  JOB_STATE.set(jobId, state);
+
+  setImmediate(() => {
+    runLongRenderJob({ jobId, storybookUrl, baseUrl }).catch((err) => {
+      console.error(`[${jobId}] runLongRenderJob threw:`, err);
+    });
+  });
+
+  res.status(202).json({
+    jobId,
+    statusUrl: `${baseUrl}/preview-status/${jobId}`,
+    status: 'pending',
+    version: 'long',
+  });
+}
 
 app.listen(PORT, () => {
   console.log(`studeo-preview-worker listening on ${PORT}`);
