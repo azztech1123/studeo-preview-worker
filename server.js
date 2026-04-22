@@ -9,11 +9,34 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { v2 as cloudinary } from 'cloudinary';
 
 const PREVIEWS_DIR = '/tmp/previews';
 const CINEMAGRAPHS_DIR = '/tmp/cinemagraphs';
 const PORT = process.env.PORT || 3000;
 const HB_KEY = process.env.HB_KEY;
+
+// Cloudinary config — optional. If any of the three env vars are missing,
+// uploads are skipped and mp4Url falls back to the Railway /previews/ URL.
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || 'studeo-previews';
+const CLOUDINARY_ENABLED = !!(
+  CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET
+);
+
+if (CLOUDINARY_ENABLED) {
+  cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: CLOUDINARY_API_KEY,
+    api_secret: CLOUDINARY_API_SECRET,
+    secure: true,
+  });
+  console.log(`cloudinary: enabled, folder="${CLOUDINARY_FOLDER}"`);
+} else {
+  console.log('cloudinary: DISABLED (missing env vars), falling back to Railway /previews/ URLs');
+}
 
 if (!HB_KEY) {
   console.error('FATAL: HB_KEY env var not set');
@@ -107,6 +130,34 @@ async function downloadToFile(url, filePath) {
   const buf = Buffer.from(await res.arrayBuffer());
   await fs.writeFile(filePath, buf);
   return buf.length;
+}
+
+// Upload a local MP4 to Cloudinary. Returns the secure public URL.
+// Uses public_id = jobId so re-renders with the same jobId overwrite,
+// keeping URLs stable per storybook (overwrite: true is explicit about this).
+// resource_type: 'video' is required so Cloudinary treats the file as video.
+// No transformation requested — the MP4 is stored byte-for-byte as uploaded.
+// Folder is configurable via CLOUDINARY_FOLDER env var.
+async function uploadToCloudinary(localPath, jobId) {
+  if (!CLOUDINARY_ENABLED) {
+    throw new Error('cloudinary not configured');
+  }
+  const result = await cloudinary.uploader.upload(localPath, {
+    resource_type: 'video',
+    folder: CLOUDINARY_FOLDER,
+    public_id: jobId,
+    overwrite: true,
+    invalidate: true,   // purge CDN cache if this jobId was re-uploaded
+    use_filename: false,
+    unique_filename: false,
+  });
+  return {
+    secureUrl: result.secure_url,
+    publicId: result.public_id,
+    bytes: result.bytes,
+    duration: result.duration,
+    format: result.format,
+  };
 }
 
 async function pollVideoUrl(sessionId, timeoutMs = 120000) {
@@ -557,9 +608,29 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
       return { ok: false, log, outPath, rawVideoUrl };
     }
 
+    // Upload to Cloudinary for persistent hosting. If it fails, we fall back
+    // to the Railway /previews/ URL — render is not failed on upload error.
+    let cloudinaryUrl = null;
+    if (CLOUDINARY_ENABLED) {
+      const uploadStart = Date.now();
+      try {
+        const result = await uploadToCloudinary(outPath, jobId);
+        cloudinaryUrl = result.secureUrl;
+        log.cloudinary = {
+          url: result.secureUrl,
+          bytes: result.bytes,
+          uploadMs: Date.now() - uploadStart,
+        };
+        console.log(`[${jobId}] cloudinary upload ok: ${result.secureUrl} (${Date.now() - uploadStart}ms)`);
+      } catch (upErr) {
+        log.cloudinary = { error: upErr.message, uploadMs: Date.now() - uploadStart };
+        console.warn(`[${jobId}] cloudinary upload failed, falling back to Railway URL: ${upErr.message}`);
+      }
+    }
+
     log.pass = true;
     log.reason = null;
-    return { ok: true, log, outPath, rawVideoUrl };
+    return { ok: true, log, outPath, rawVideoUrl, cloudinaryUrl };
   } catch (e) {
     log.pass = false;
     log.reason = e.message;
@@ -695,8 +766,10 @@ async function runRenderJob({ jobId, storybookUrl, baseUrl }) {
     }
 
     const st = await fs.stat(success.outPath);
+    const fallbackUrl = `${baseUrl}/previews/${jobId}.mp4`;
     state.status = 'completed';
-    state.mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
+    state.mp4Url = success.cloudinaryUrl || fallbackUrl;
+    state.fallbackMp4Url = fallbackUrl;
     state.rawMp4Url = rawVideoUrl;
     state.pageCount = success.log.pageCount;
     state.duration = success.log.duration;
@@ -751,10 +824,12 @@ app.post('/render-preview', async (req, res) => {
   }
 
   const st = await fs.stat(success.outPath);
-  const mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
+  const fallbackUrl = `${baseUrl}/previews/${jobId}.mp4`;
+  const mp4Url = success.cloudinaryUrl || fallbackUrl;
 
   res.json({
     mp4Url,
+    fallbackMp4Url: fallbackUrl,
     rawMp4Url: rawVideoUrl,
     pageCount: success.log.pageCount,
     duration: success.log.duration,
@@ -1090,9 +1165,28 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
       return { ok: false, log, outPath, rawVideoUrl };
     }
 
+    // Upload to Cloudinary for persistent hosting (same pattern as short mode).
+    let cloudinaryUrl = null;
+    if (CLOUDINARY_ENABLED) {
+      const uploadStart = Date.now();
+      try {
+        const result = await uploadToCloudinary(outPath, jobId);
+        cloudinaryUrl = result.secureUrl;
+        log.cloudinary = {
+          url: result.secureUrl,
+          bytes: result.bytes,
+          uploadMs: Date.now() - uploadStart,
+        };
+        console.log(`[${jobId}] LONG cloudinary upload ok: ${result.secureUrl} (${Date.now() - uploadStart}ms)`);
+      } catch (upErr) {
+        log.cloudinary = { error: upErr.message, uploadMs: Date.now() - uploadStart };
+        console.warn(`[${jobId}] LONG cloudinary upload failed, falling back to Railway URL: ${upErr.message}`);
+      }
+    }
+
     log.pass = true;
     log.reason = null;
-    return { ok: true, log, outPath, rawVideoUrl };
+    return { ok: true, log, outPath, rawVideoUrl, cloudinaryUrl };
   } catch (e) {
     log.pass = false;
     log.reason = e.message;
@@ -1149,9 +1243,11 @@ async function runLongRenderJob({ jobId, storybookUrl, baseUrl }) {
     }
 
     const st = await fs.stat(success.outPath);
+    const fallbackUrl = `${baseUrl}/previews/${jobId}.mp4`;
     state.status = 'completed';
     state.version = 'long';
-    state.mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
+    state.mp4Url = success.cloudinaryUrl || fallbackUrl;
+    state.fallbackMp4Url = fallbackUrl;
     state.rawMp4Url = rawVideoUrl;
     state.pageCount = success.log.pageCount;
     state.duration = success.log.duration;
@@ -1205,10 +1301,12 @@ async function handleLongSyncRender(req, res) {
   }
 
   const st = await fs.stat(success.outPath);
-  const mp4Url = `${baseUrl}/previews/${jobId}.mp4`;
+  const fallbackUrl = `${baseUrl}/previews/${jobId}.mp4`;
+  const mp4Url = success.cloudinaryUrl || fallbackUrl;
 
   res.json({
     mp4Url,
+    fallbackMp4Url: fallbackUrl,
     rawMp4Url: rawVideoUrl,
     version: 'long',
     pageCount: success.log.pageCount,
