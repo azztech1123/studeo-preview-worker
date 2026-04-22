@@ -111,12 +111,16 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
     //   - Force a keyframe at t=0 so the first decodable frame is immediate
     //   - Add a silent AAC audio track (many thumbnailers expect audio;
     //     video-only MP4s sometimes render as black in iMessage)
+    //   - Put -ss AFTER -i (output seeking) + reset/avoid_negative_ts so the
+    //     output's first frame is at exactly t=0. Input seeking (-ss before
+    //     -i) left the MP4 with start_time=0.1s instead of 0, causing
+    //     iMessage's thumbnail fetch at t=0 to return black.
     const args = [
       '-y',
-      '-ss', startSec.toFixed(3),
       '-i', inPath,
       '-f', 'lavfi',
       '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+      '-ss', startSec.toFixed(3),
       '-t', durationSec.toFixed(3),
       '-map', '0:v:0',
       '-map', '1:a:0',
@@ -131,6 +135,8 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
       '-c:a', 'aac',
       '-b:a', '64k',
       '-shortest',
+      '-avoid_negative_ts', 'make_zero',
+      '-reset_timestamps', '1',
       '-movflags', '+faststart',
       outPath,
     ];
