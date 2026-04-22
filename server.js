@@ -111,10 +111,14 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
     //   - Force a keyframe at t=0 so the first decodable frame is immediate
     //   - Add a silent AAC audio track (many thumbnailers expect audio;
     //     video-only MP4s sometimes render as black in iMessage)
-    //   - Put -ss AFTER -i (output seeking) + reset/avoid_negative_ts so the
-    //     output's first frame is at exactly t=0. Input seeking (-ss before
-    //     -i) left the MP4 with start_time=0.1s instead of 0, causing
-    //     iMessage's thumbnail fetch at t=0 to return black.
+    //   - ELIMINATE THE EDIT LIST: use setpts=PTS-STARTPTS filter so frames
+    //     themselves are timestamped starting at 0. ffmpeg's default is to
+    //     add an edit list (edts/elst atoms) that tells decoders to skip
+    //     the initial gap, but iMessage's thumbnailer does NOT honor edit
+    //     lists. The thumbnailer sees frame 1 at t=0.1s and asks "frame at
+    //     t=0?" — gets nothing — falls back to black. The setpts filter
+    //     rewrites each frame's PTS so frame 1 is at exactly t=0 in its own
+    //     data, no edit list needed.
     const args = [
       '-y',
       '-i', inPath,
@@ -124,6 +128,8 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
       '-t', durationSec.toFixed(3),
       '-map', '0:v:0',
       '-map', '1:a:0',
+      '-vf', 'setpts=PTS-STARTPTS',
+      '-af', 'asetpts=PTS-STARTPTS',
       '-c:v', 'libx264',
       '-profile:v', 'main',
       '-level', '4.0',
@@ -136,7 +142,6 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
       '-b:a', '64k',
       '-shortest',
       '-avoid_negative_ts', 'make_zero',
-      '-reset_timestamps', '1',
       '-movflags', '+faststart',
       outPath,
     ];
