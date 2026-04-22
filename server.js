@@ -101,15 +101,36 @@ function probeDuration(filePath) {
 
 function trimMp4(inPath, outPath, startSec, durationSec) {
   return new Promise((resolve, reject) => {
+    // iMessage thumbnailer is pickier than ffmpeg/browsers. To make the
+    // output reliably generate thumbnails in iMessage (via Blooio/Apple):
+    //   - Force H.264 Main profile (High profile trips some thumbnailers)
+    //   - Force level 4.0 (widely supported, safe for 1080p)
+    //   - Force yuv420p explicitly (was implicit, now guaranteed)
+    //   - Force 30fps via -r (input may be 10fps from HB, low-fps videos
+    //     can fail the "find decodable frame near t=0" heuristic)
+    //   - Force a keyframe at t=0 so the first decodable frame is immediate
+    //   - Add a silent AAC audio track (many thumbnailers expect audio;
+    //     video-only MP4s sometimes render as black in iMessage)
     const args = [
       '-y',
       '-ss', startSec.toFixed(3),
       '-i', inPath,
+      '-f', 'lavfi',
+      '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
       '-t', durationSec.toFixed(3),
+      '-map', '0:v:0',
+      '-map', '1:a:0',
       '-c:v', 'libx264',
-      '-preset', 'fast',
+      '-profile:v', 'main',
+      '-level', '4.0',
+      '-pix_fmt', 'yuv420p',
+      '-r', '30',
+      '-force_key_frames', '0',
+      '-preset', 'veryfast',
       '-crf', '23',
-      '-an',
+      '-c:a', 'aac',
+      '-b:a', '64k',
+      '-shortest',
       '-movflags', '+faststart',
       outPath,
     ];
