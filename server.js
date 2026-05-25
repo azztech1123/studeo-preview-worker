@@ -212,6 +212,13 @@ async function pollVideoUrl(sessionId, timeoutMs = 120000) {
   throw new Error(`video url unavailable: ${lastErr?.message || 'timeout'}`);
 }
 
+// Click a Studeo book-navigation control by its stable id (#nav-forward /
+// #nav-back). page.click auto-waits for visibility + actionability; the short
+// timeout fails fast if the control is absent rather than stalling ~30s.
+async function clickNav(page, selector) {
+  await page.click(selector, { timeout: 8000 });
+}
+
 // ========================================================
 //  Cinemagraph pre-transcoding pipeline
 // ========================================================
@@ -514,16 +521,15 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
         if (document.body && document.body.focus) document.body.focus();
       } catch {}
     });
-    await page.mouse.click(960, 540);
-    await page.waitForTimeout(200);
-    await page.keyboard.press('Tab');
-    await page.waitForTimeout(300);
-
     // Let Studeo's library.js inject <video> elements + our route warm up.
     // Extra buffer so the cover is actually PAINTED and stable before we
     // mark choreoStartMs — otherwise the cover dwell burns on a blank/loading
     // screen and the real cover content barely appears in the recording.
     await page.waitForTimeout(2500);
+
+    // Storybook nav controls are rendered client-side; confirm before
+    // choreography so a template missing them fails fast (and retries).
+    await page.waitForSelector('#nav-forward', { state: 'visible', timeout: 10000 });
 
     const snap = async (label) => {
       try {
@@ -555,22 +561,22 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     await snap('t=0_cover');
     await page.waitForTimeout(2000);                 // cover dwell
 
-    await page.keyboard.press('ArrowRight');
+    await clickNav(page, '#nav-forward');
     await page.waitForTimeout(1200);                 // transition to spread 2
     await snap('t=3.2_spread-2-in');
     await page.waitForTimeout(5000);                 // spread 2 forward dwell (+2s)
 
-    await page.keyboard.press('ArrowRight');
+    await clickNav(page, '#nav-forward');
     await page.waitForTimeout(1200);                 // transition to spread 3
     await snap('t=9.4_spread-3-in');
     await page.waitForTimeout(5000);                 // spread 3 forward dwell (+2s)
 
-    await page.keyboard.press('ArrowLeft');
+    await clickNav(page, '#nav-back');
     await page.waitForTimeout(1200);                 // transition back to spread 2
     await snap('t=15.6_spread-2-back');
     await page.waitForTimeout(1500);                 // backward dwell (unchanged)
 
-    await page.keyboard.press('ArrowLeft');
+    await clickNav(page, '#nav-back');
     await page.waitForTimeout(1200);                 // transition back to cover
     await snap('t=18.3_cover-back');
     await page.waitForTimeout(1500);                 // final cover dwell
@@ -1075,12 +1081,11 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
         if (document.body && document.body.focus) document.body.focus();
       } catch {}
     });
-    await page.mouse.click(960, 540);
-    await page.waitForTimeout(200);
-    await page.keyboard.press('Tab');
-    await page.waitForTimeout(300);
-
     await page.waitForTimeout(2500);
+
+    // Storybook nav controls are rendered client-side; confirm before
+    // choreography so a template missing them fails fast (and retries).
+    await page.waitForSelector('#nav-forward', { state: 'visible', timeout: 10000 });
 
     const snap = async (label) => {
       try {
@@ -1122,7 +1127,7 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
     await page.waitForTimeout(COVER_DWELL);
 
     for (let i = 1; i <= spreadsShown; i++) {
-      await page.keyboard.press('ArrowRight');
+      await clickNav(page, '#nav-forward');
       await page.waitForTimeout(TRANSITION);
       if (i === 1 || i === spreadsShown) {
         await snap(`t_approx_spread-${i}-in`);
