@@ -109,6 +109,16 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
     //   - Force 30fps via -r (input may be 10fps from HB, low-fps videos
     //     can fail the "find decodable frame near t=0" heuristic)
     //   - Force a keyframe at t=0 so the first decodable frame is immediate
+    //   - Disable B-frames (-bf 0): older AVFoundation thumbnailers
+    //     misbehave on decode-order-vs-display-order reorder in the first
+    //     GOP, even with a forced I-frame at t=0
+    //   - Short GOP (-g 60 -keyint_min 60): I-frame every 2s so iMessage's
+    //     seek-to-thumbnail (often with non-zero tolerance) always lands on
+    //     a content keyframe, never falls into a B-frame decode chain
+    //   - Tag color metadata explicitly (bt709 primaries/transfer/matrix,
+    //     tv range) + write_colr in movflags so the colr box is embedded.
+    //     Without these, AVFoundation defaults to BT.601 limited-range and
+    //     the BT.709 source decodes washed-out or near-black
     //   - Add a silent AAC audio track (many thumbnailers expect audio;
     //     video-only MP4s sometimes render as black in iMessage)
     //   - ELIMINATE THE EDIT LIST: use setpts=PTS-STARTPTS filter so frames
@@ -134,7 +144,14 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
       '-profile:v', 'main',
       '-level', '4.0',
       '-pix_fmt', 'yuv420p',
+      '-color_primaries', 'bt709',
+      '-color_trc',       'bt709',
+      '-colorspace',      'bt709',
+      '-color_range',     'tv',
       '-r', '30',
+      '-g', '60',
+      '-keyint_min', '60',
+      '-bf', '0',
       '-force_key_frames', '0',
       '-preset', 'veryfast',
       '-crf', '23',
@@ -142,7 +159,7 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
       '-b:a', '64k',
       '-shortest',
       '-avoid_negative_ts', 'make_zero',
-      '-movflags', '+faststart',
+      '-movflags', '+faststart+write_colr',
       outPath,
     ];
     const proc = spawn('ffmpeg', args);
@@ -416,7 +433,15 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     log.pretranscode = pretranscode.stats;
     console.log(`[${jobId}] session ${session.id}`);
 
-    const sessionStartMs = Date.now();
+    // Wall-clock anchor for the recording. HB starts recording at session
+    // creation, so the delta from here to any later Date.now() approximates
+    // the offset of that moment within the raw video. Used below to trim
+    // from the choreography START, not from the recording's END — the old
+    // tail-anchored approach assumed HB's post-stop tail was ~0.3s when in
+    // reality it's 1.5-4s (browser.close + sessions.stop + HB buffer flush),
+    // which made trimStart land in the pre-choreography preamble (loading
+    // screen / blank page → black frame at t=0 → black iMessage thumbnail).
+    const recordingT0Ms = Date.now();
 
     browser = await chromium.connectOverCDP(session.wsEndpoint);
     const context = browser.contexts()[0] || (await browser.newContext());
@@ -610,16 +635,15 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     const rawPath = path.join(PREVIEWS_DIR, `${jobId}_raw.mp4`);
     await downloadToFile(rawVideoUrl, rawPath);
 
-    // Anchor trim from the END of the raw recording, not from a guessed
-    // sessionStartMs offset. HB's recording clock is not synchronized with
-    // our Node.js Date.now() — the raw can easily be 25+ seconds of preamble
-    // (session boot, page load, buffer waits) before choreography begins.
-    // Since hb.sessions.stop() was called immediately after choreoEndMs, the
-    // LAST trimDuration seconds of the raw ARE our choreography window.
+    // Anchor trim from recording T0 (session create) using wall-clock delta.
+    // The leadIn shifts trimStart slightly earlier than choreoStartMs so the
+    // first output frame lands on the painted cover, not on the snap() instant
+    // where the cinemagraph might still be at readyState < 2 (which would render
+    // as a black <video> rectangle and cause iMessage to extract a black thumb).
     const rawDuration = await probeDuration(rawPath);
     log.rawDuration = Number(rawDuration.toFixed(2));
-    const tailCushion = 0.3; // small buffer in case HB appends frames after stop()
-    const trimStart = Math.max(0, rawDuration - trimDuration - tailCushion);
+    const leadIn = 0.5;
+    const trimStart = Math.max(0, (choreoStartMs - recordingT0Ms) / 1000 - leadIn);
     log.trimStart = Number(trimStart.toFixed(2));
 
     const outPath = path.join(PREVIEWS_DIR, `${jobId}.mp4`);
@@ -995,6 +1019,9 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
     log.pretranscode = pretranscode.stats;
     console.log(`[${jobId}] LONG session ${session.id}`);
 
+    // Wall-clock anchor for the recording — see comment in runOneAttempt.
+    const recordingT0Ms = Date.now();
+
     browser = await chromium.connectOverCDP(session.wsEndpoint);
     const context = browser.contexts()[0] || (await browser.newContext());
     const page = context.pages()[0] || (await context.newPage());
@@ -1191,10 +1218,12 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
     const rawPath = path.join(PREVIEWS_DIR, `${jobId}_raw.mp4`);
     await downloadToFile(rawVideoUrl, rawPath);
 
+    // Anchor trim from recording T0 (session create) using wall-clock delta —
+    // see comment in runOneAttempt for the rationale.
     const rawDuration = await probeDuration(rawPath);
     log.rawDuration = Number(rawDuration.toFixed(2));
-    const tailCushion = 0.3;
-    const trimStart = Math.max(0, rawDuration - trimDuration - tailCushion);
+    const leadIn = 0.5;
+    const trimStart = Math.max(0, (choreoStartMs - recordingT0Ms) / 1000 - leadIn);
     log.trimStart = Number(trimStart.toFixed(2));
 
     const outPath = path.join(PREVIEWS_DIR, `${jobId}.mp4`);
@@ -1478,6 +1507,9 @@ async function runCompleteForwardAttempt({ storybookUrl, jobId, attemptNum, base
     log.pretranscode = pretranscode.stats;
     console.log(`[${jobId}] COMPLETE session ${session.id}`);
 
+    // Wall-clock anchor for the recording — see comment in runOneAttempt.
+    const recordingT0Ms = Date.now();
+
     browser = await chromium.connectOverCDP(session.wsEndpoint);
     const context = browser.contexts()[0] || (await browser.newContext());
     const page = context.pages()[0] || (await context.newPage());
@@ -1659,10 +1691,12 @@ async function runCompleteForwardAttempt({ storybookUrl, jobId, attemptNum, base
     const rawPath = path.join(PREVIEWS_DIR, `${jobId}_raw.mp4`);
     await downloadToFile(rawVideoUrl, rawPath);
 
+    // Anchor trim from recording T0 (session create) using wall-clock delta —
+    // see comment in runOneAttempt for the rationale.
     const rawDuration = await probeDuration(rawPath);
     log.rawDuration = Number(rawDuration.toFixed(2));
-    const tailCushion = 0.3;
-    const trimStart = Math.max(0, rawDuration - trimDuration - tailCushion);
+    const leadIn = 0.5;
+    const trimStart = Math.max(0, (choreoStartMs - recordingT0Ms) / 1000 - leadIn);
     log.trimStart = Number(trimStart.toFixed(2));
 
     const outPath = path.join(PREVIEWS_DIR, `${jobId}.mp4`);
