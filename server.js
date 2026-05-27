@@ -119,27 +119,30 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
     //     tv range) + write_colr in movflags so the colr box is embedded.
     //     Without these, AVFoundation defaults to BT.601 limited-range and
     //     the BT.709 source decodes washed-out or near-black
-    //   - Add a silent AAC audio track (many thumbnailers expect audio;
-    //     video-only MP4s sometimes render as black in iMessage)
-    //   - ELIMINATE THE EDIT LIST: use setpts=PTS-STARTPTS filter so frames
-    //     themselves are timestamped starting at 0. ffmpeg's default is to
-    //     add an edit list (edts/elst atoms) that tells decoders to skip
-    //     the initial gap, but iMessage's thumbnailer does NOT honor edit
-    //     lists. The thumbnailer sees frame 1 at t=0.1s and asks "frame at
-    //     t=0?" — gets nothing — falls back to black. The setpts filter
-    //     rewrites each frame's PTS so frame 1 is at exactly t=0 in its own
-    //     data, no edit list needed.
+    //   - NO AUDIO TRACK. A previous version added a silent AAC track on
+    //     the folklore that "video-only MP4s sometimes render as black in
+    //     iMessage". Empirically that was wrong: AAC's encoder priming
+    //     delay (~2048 samples / ~46ms at 44.1kHz) forces the MP4 muxer to
+    //     insert an "empty edit" (elst entry with media_time=-1, duration
+    //     ≈ 860 / 15360 = 56ms) at the head of the VIDEO track to keep A/V
+    //     in sync. iMessage's thumbnailer doesn't honor edit lists, asks
+    //     for frame at t=0, sees "empty edit, no frame there", falls back
+    //     to black. Removing the audio eliminates priming → no empty edit
+    //     → video starts at PTS=0 → iMessage thumbnail shows the cover.
+    //     (Verified by ffprobe: with audio, video start_pts=860; without
+    //     audio, video start_pts=0.)
+    //   - ELIMINATE THE EDIT LIST: setpts=PTS-STARTPTS filter resets the
+    //     first frame's PTS to 0 — combined with the no-audio fix above,
+    //     this gives a clean single-entry edit list (media_time=0, normal
+    //     "play from start") that every thumbnailer accepts.
     const args = [
       '-y',
       '-i', inPath,
-      '-f', 'lavfi',
-      '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
       '-ss', startSec.toFixed(3),
       '-t', durationSec.toFixed(3),
       '-map', '0:v:0',
-      '-map', '1:a:0',
+      '-an',
       '-vf', 'setpts=PTS-STARTPTS',
-      '-af', 'asetpts=PTS-STARTPTS',
       '-c:v', 'libx264',
       '-profile:v', 'main',
       '-level', '4.0',
@@ -155,9 +158,6 @@ function trimMp4(inPath, outPath, startSec, durationSec) {
       '-force_key_frames', '0',
       '-preset', 'veryfast',
       '-crf', '23',
-      '-c:a', 'aac',
-      '-b:a', '64k',
-      '-shortest',
       '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart+write_colr',
       outPath,
