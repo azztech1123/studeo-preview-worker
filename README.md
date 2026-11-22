@@ -65,20 +65,23 @@ Fails retry up to 3 attempts. If all 3 fail, response is 500 with the per-attemp
 | `SESSION_MAX_HOLD_MS` | no | Longest one session may hold a slot before the worker stops it. Default 600000 |
 | `MAX_JOBS` | no | Most renders running at once. Default 10. Extra renders wait in line and use no CPU and no Hyperbrowser session while they wait. Keep it at or below `MAX_SESSIONS`. |
 | `MAX_SETUP` | no | Of the running renders, how many may be converting cinemagraphs with ffmpeg at the same moment. Default 3. This is the CPU-heavy step. |
+| `MAX_TRANSCODES` | no | Most single ffmpeg conversions running at once, counted over all renders. Default 6 (each uses 4 threads, so 6 fills a 24-CPU machine). A book's cinemagraphs take turns instead of all starting together. |
 | `JOB_WAIT_MS` | no | Longest a render waits in line before it is turned away with a `BUSY` error. Default 150000 |
 | `LOCAL_KEEP_MS` | no | How long a video's local copy stays on disk after it has been uploaded to Cloudinary. Default 600000 |
 
 `GET /health` reports how busy the worker is:
 
 ```json
-{"ok":true,"sessions":{"max":20,"inUse":7,"waiting":0},"jobs":{"max":10,"inUse":7,"waiting":0},"converting":{"max":3,"inUse":1,"waiting":0},"localVideos":{"files":41,"mb":352},"memoryMb":310}
+{"ok":true,"sessions":{"max":20,"inUse":7,"waiting":0},"jobs":{"max":10,"inUse":7,"waiting":0},"converting":{"max":3,"inUse":1,"waiting":0},"transcodes":{"max":6,"inUse":4,"waiting":2},"localVideos":{"files":41,"mb":352},"memoryMb":310}
 ```
 
 `jobs.waiting` above 0 for more than a minute or two means renders are arriving faster than this worker finishes them: slow the caller down.
 
 ## Capacity and how to run it
 
-- One render takes a little over a minute, so 10 at once is about 8 a minute. Send it no more than that. In the Flow Guide pipeline the pace is set by the Hookdeck connection that resumes the waiting n8n run (7 a minute).
+- One render takes a little over a minute when the worker is not crowded. Measured on 22 Nov 2026: at 3 a minute, renders took 71 to 77 seconds. A burst at 7 a minute piled up and 12 of 22 runs lost their video; that burst is what the "convert first" order and the `MAX_TRANSCODES` limit below were added for. Raise the pace in small steps and watch `/health`. In the Flow Guide pipeline the pace is set by the Hookdeck connection that resumes the waiting n8n run.
+- Each render converts its cinemagraphs first and opens the Hyperbrowser session second. Hyperbrowser records from the moment the session exists and the cut is measured from that moment, so a slow conversion can no longer shift the cut (blank page at the start, last pages missing) or burn session time.
+- A second or third attempt at the same video goes to the head of the line.
 - A render waits its turn before it does anything, so a burst is queued, not dropped. A render that waits longer than `JOB_WAIT_MS` is refused with `BUSY` (HTTP 422, `error` starts with `BUSY`). The caller should try again a little later.
 - The same `storybookId` asked for twice while it is being rendered is rendered once: the second request joins the first and gets the same answer. So a caller that timed out can simply ask again.
 - The n8n workflow that calls the sync `/render-preview` endpoint hangs up after 5 minutes (seen on 22 Nov 2026: Railway logged those requests as 499, closed by the caller, at 300 seconds). The render carries on here after the caller has gone. Asking again with the same `storybookId` joins it.
