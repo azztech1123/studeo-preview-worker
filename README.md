@@ -63,7 +63,27 @@ Fails retry up to 3 attempts. If all 3 fail, response is 500 with the per-attemp
 | `MAX_SESSIONS` | no | Most Hyperbrowser sessions this worker holds at once. Default 20 (the Startup plan allows 25 for the whole team). Extra renders wait their turn. |
 | `SESSION_WAIT_MS` | no | Longest a render waits for a free session slot before it fails with `BUSY`. Default 120000 |
 | `SESSION_MAX_HOLD_MS` | no | Longest one session may hold a slot before the worker stops it. Default 600000 |
+| `MAX_JOBS` | no | Most renders running at once. Default 10. Extra renders wait in line and use no CPU and no Hyperbrowser session while they wait. Keep it at or below `MAX_SESSIONS`. |
+| `MAX_SETUP` | no | Of the running renders, how many may be converting cinemagraphs with ffmpeg at the same moment. Default 3. This is the CPU-heavy step. |
+| `JOB_WAIT_MS` | no | Longest a render waits in line before it is turned away with a `BUSY` error. Default 150000 |
+| `LOCAL_KEEP_MS` | no | How long a video's local copy stays on disk after it has been uploaded to Cloudinary. Default 600000 |
 
-`GET /health` reports the queue: `{"ok":true,"sessions":{"max":20,"inUse":3,"waiting":0}}`.
+`GET /health` reports how busy the worker is:
 
-Run one replica only. The worker keeps each render's converted cinemagraphs on its own disk and the recording browser fetches them back through the public address, so a second replica would answer some of those requests with 404.
+```json
+{"ok":true,"sessions":{"max":20,"inUse":7,"waiting":0},"jobs":{"max":10,"inUse":7,"waiting":0},"converting":{"max":3,"inUse":1,"waiting":0},"localVideos":{"files":41,"mb":352},"memoryMb":310}
+```
+
+`jobs.waiting` above 0 for more than a minute or two means renders are arriving faster than this worker finishes them: slow the caller down.
+
+## Capacity and how to run it
+
+- One render takes a little over a minute, so 10 at once is about 8 a minute. Send it no more than that. In the Flow Guide pipeline the pace is set by the Hookdeck connection that resumes the waiting n8n run (7 a minute).
+- A render waits its turn before it does anything, so a burst is queued, not dropped. A render that waits longer than `JOB_WAIT_MS` is refused with `BUSY` (HTTP 422, `error` starts with `BUSY`). The caller should try again a little later.
+- The same `storybookId` asked for twice while it is being rendered is rendered once: the second request joins the first and gets the same answer. So a caller that timed out can simply ask again.
+- The n8n workflow that calls the sync `/render-preview` endpoint hangs up after 5 minutes (seen on 22 Nov 2026: Railway logged those requests as 499, closed by the caller, at 300 seconds). The render carries on here after the caller has gone. Asking again with the same `storybookId` joins it.
+- Local disk is temporary. A video's local copy is deleted 10 minutes after it reaches Cloudinary. Videos that could not be uploaded stay for 72 hours and are then swept. Nothing on this disk survives a redeploy or restart.
+- A redeploy or restart drops every render in progress. Before deploying, stop sending renders and wait until `/health` shows `jobs.inUse` at 0.
+- Run `node tests/job-gate.test.mjs` after changing the job gate. It needs no keys.
+
+Run one replica only. The worker keeps each render's converted cinemagraphs on its own disk and the recording browser fetches them back through the public address, so a second replica would answer some of those requests with 404. The line of waiting renders and the "same video asked twice" check also live in this one process.

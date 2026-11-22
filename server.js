@@ -150,6 +150,156 @@ async function stopSessionGated(sessionId) {
 }
 
 // ========================================================
+//  Job gate
+// ========================================================
+// The session gate above keeps this worker inside Hyperbrowser's cap, but a
+// render does more than hold a session: before the browser opens, it converts
+// every moving picture in the storybook with ffmpeg. That conversion used to
+// start the moment a request arrived, whether or not a session slot was free.
+// On 22 Nov 2026, 69 renders arrived within ten minutes: 20 held sessions, 49
+// waited for one, and all 69 were converting at once. The machine ran out of
+// CPU and could not start more ffmpeg processes (spawn ffmpeg EAGAIN), renders
+// slowed, waits timed out, callers retried, and each retry started the same
+// video a second time on top of the first.
+//
+// So a render now waits its turn BEFORE it does anything:
+//   - at most MAX_JOBS renders run at once. The rest wait in line, first in,
+//     first out, using no CPU and no Hyperbrowser session while they wait;
+//   - at most MAX_SETUP of the running renders may be in the conversion step
+//     at the same moment (that step is the CPU-heavy one);
+//   - a render that waits longer than JOB_WAIT_MS is turned away with a clear
+//     BUSY error, so the caller can try again instead of hanging;
+//   - if the same video is asked for again while it is still being made (a
+//     caller that timed out and retried), the second request joins the first
+//     instead of starting a duplicate.
+// Local files: once a video is safely on Cloudinary, its copy on this machine
+// is deleted after LOCAL_KEEP_MS, and a failed attempt's leftovers are removed,
+// so the disk does not fill up over a long run.
+//
+//   MAX_JOBS        renders running at once                        (default 10)
+//   MAX_SETUP       of those, how many may convert at once         (default 3)
+//   JOB_WAIT_MS     longest a render waits in line                 (default 150000)
+//   LOCAL_KEEP_MS   how long an uploaded video's local copy stays  (default 600000)
+// ---- job gate: begin (tests/job-gate.test.mjs runs this block) ----
+const MAX_JOBS = envInt('MAX_JOBS', 10, 1);
+const MAX_SETUP = envInt('MAX_SETUP', 3, 1);
+const JOB_WAIT_MS = envInt('JOB_WAIT_MS', 150000, 100);
+const LOCAL_KEEP_MS = envInt('LOCAL_KEEP_MS', 600000, 1000);
+
+// A first-in, first-out gate. waitMs of 0 means wait as long as it takes.
+function makeGate(max, waitMs, busyMessage) {
+  let inUse = 0;
+  const waiters = [];
+  return {
+    acquire() {
+      if (inUse < max) {
+        inUse++;
+        return Promise.resolve();
+      }
+      return new Promise((resolve, reject) => {
+        const waiter = {};
+        waiter.grant = () => { clearTimeout(waiter.timer); resolve(); };
+        if (waitMs > 0) {
+          waiter.timer = setTimeout(() => {
+            const i = waiters.indexOf(waiter);
+            if (i >= 0) waiters.splice(i, 1);
+            reject(new Error(busyMessage));
+          }, waitMs);
+        }
+        waiters.push(waiter);
+      });
+    },
+    release() {
+      const next = waiters.shift();
+      if (next) next.grant();      // the place goes straight to the next in line
+      else inUse = Math.max(0, inUse - 1);
+    },
+    stats() {
+      return { max, inUse, waiting: waiters.length };
+    },
+  };
+}
+
+const jobGate = makeGate(
+  MAX_JOBS,
+  JOB_WAIT_MS,
+  `BUSY - all ${MAX_JOBS} render places stayed taken for ${Math.round(JOB_WAIT_MS / 1000)}s, try again shortly`
+);
+const setupGate = makeGate(MAX_SETUP, 0, '');
+const setupHolders = new Set();        // jobIds now in the conversion step
+const inFlightAttempts = new Map();    // jobId -> the attempt now running or waiting
+
+function releaseSetupSlot(jobId) {
+  if (setupHolders.delete(jobId)) setupGate.release();
+}
+
+// Every attempt function (short, long, complete) is called through this.
+function gatedAttempt(runAttempt, args) {
+  const { jobId } = args;
+  const running = inFlightAttempts.get(jobId);
+  if (running) {
+    console.log(`[${jobId}] already being rendered, joining that render instead of starting another`);
+    return running;
+  }
+  const attempt = (async () => {
+    const queuedAt = Date.now();
+    try {
+      await jobGate.acquire();
+    } catch (err) {
+      console.warn(`[${jobId}] ${err.message}`);
+      return {
+        ok: false,
+        fatal: true,       // no point trying again at once: the caller should come back later
+        log: { attempt: args.attemptNum, pass: false, reason: err.message, queuedMs: Date.now() - queuedAt },
+      };
+    }
+    let result = null;
+    try {
+      await setupGate.acquire();
+      setupHolders.add(jobId);
+      const queuedMs = Date.now() - queuedAt;
+      if (queuedMs > 1000) console.log(`[${jobId}] waited ${Math.round(queuedMs / 1000)}s in line`);
+      result = await runAttempt(args);
+      if (result && result.log) result.log.queuedMs = queuedMs;
+      return result;
+    } finally {
+      releaseSetupSlot(jobId);       // normally given back already, when the conversion step ended
+      jobGate.release();
+      tidyLocalFiles(jobId, result);
+    }
+  })();
+  inFlightAttempts.set(jobId, attempt);
+  const forget = () => {
+    if (inFlightAttempts.get(jobId) === attempt) inFlightAttempts.delete(jobId);
+  };
+  attempt.then(forget, forget);
+  return attempt;
+}
+
+// After an attempt: remove what nothing will ask for again.
+function tidyLocalFiles(jobId, result) {
+  // a failed attempt can leave its raw recording behind (a good one already deleted it)
+  fs.unlink(path.join(PREVIEWS_DIR, `${jobId}_raw.mp4`)).catch(() => {});
+  if (!result || !result.outPath) return;
+  const uploaded = result.ok && result.cloudinaryUrl;
+  const failed = !result.ok;
+  // Good video that is NOT on Cloudinary: its only copy is here and its address
+  // points here, so it stays (the 72-hour sweep in cleanupOldFiles removes it).
+  if (!uploaded && !failed) return;
+  const outPath = result.outPath;
+  const timer = setTimeout(async () => {
+    try {
+      if (inFlightAttempts.has(jobId)) return;                      // being rendered again right now
+      const st = await fs.stat(outPath);
+      if (Date.now() - st.mtimeMs < LOCAL_KEEP_MS - 500) return;    // a newer render wrote it, and has its own timer
+      await fs.unlink(outPath);
+    } catch {}
+  }, LOCAL_KEEP_MS);
+  timer.unref();
+}
+// ---- job gate: end ----
+
+// ========================================================
 //  helpers
 // ========================================================
 
@@ -419,7 +569,17 @@ function transcodeToWebmVp8(srcPath, destPath) {
   });
 }
 
+// The conversion step of a render. When it ends (well or badly), the render
+// gives back its conversion place so the next render in line can start its own.
 async function pretranscodeCinemagraphs(storybookUrl, jobId) {
+  try {
+    return await pretranscodeCinemagraphsUngated(storybookUrl, jobId);
+  } finally {
+    releaseSetupSlot(jobId);
+  }
+}
+
+async function pretranscodeCinemagraphsUngated(storybookUrl, jobId) {
   const result = {
     byMuxId: {},
     stats: { found: 0, transcoded: 0, failed: 0, skipped: 0, elapsedMs: 0 },
@@ -513,7 +673,12 @@ const INIT_SCRIPT = `
 //  Main render attempt
 // ========================================================
 
-async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
+// Each attempt waits its turn at the job gate (see "Job gate" above).
+function runOneAttempt(args) {
+  return gatedAttempt(runOneAttemptUngated, args);
+}
+
+async function runOneAttemptUngated({ storybookUrl, jobId, attemptNum, baseUrl }) {
   let session = null;
   let browser = null;
   const log = { attempt: attemptNum };
@@ -816,7 +981,28 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-app.get('/health', (req, res) => res.json({ ok: true, sessions: sessionGateStats() }));
+// How full the local previews folder is, refreshed once a minute for /health.
+let localFiles = { files: 0, mb: 0 };
+async function measureLocalFiles() {
+  try {
+    const names = await fs.readdir(PREVIEWS_DIR);
+    let bytes = 0;
+    for (const name of names) {
+      try { bytes += (await fs.stat(path.join(PREVIEWS_DIR, name))).size; } catch {}
+    }
+    localFiles = { files: names.length, mb: Math.round(bytes / 1048576) };
+  } catch {}
+}
+setInterval(measureLocalFiles, 60 * 1000).unref();
+
+app.get('/health', (req, res) => res.json({
+  ok: true,
+  sessions: sessionGateStats(),
+  jobs: jobGate.stats(),            // renders running, and waiting in line
+  converting: setupGate.stats(),    // renders in the ffmpeg conversion step
+  localVideos: localFiles,          // finished videos still on this machine's disk
+  memoryMb: Math.round(process.memoryUsage().rss / 1048576),
+}));
 
 app.get('/previews/:file', (req, res) => {
   const file = req.params.file;
@@ -1102,7 +1288,12 @@ await ensureDirs();
 //    - Handler bodies (handleLongSyncRender vs inline v15b handler)
 // ============================================================================
 
-async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
+// Each attempt waits its turn at the job gate (see "Job gate" above).
+function runFullForwardAttempt(args) {
+  return gatedAttempt(runFullForwardAttemptUngated, args);
+}
+
+async function runFullForwardAttemptUngated({ storybookUrl, jobId, attemptNum, baseUrl }) {
   let session = null;
   let browser = null;
   const log = { attempt: attemptNum, version: 'long' };
@@ -1590,7 +1781,12 @@ async function handleLongAsyncRender(req, res) {
 //  /webm + /previews endpoints, trim math, ffprobe/ffmpeg helpers.
 // ============================================================================
 
-async function runCompleteForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
+// Each attempt waits its turn at the job gate (see "Job gate" above).
+function runCompleteForwardAttempt(args) {
+  return gatedAttempt(runCompleteForwardAttemptUngated, args);
+}
+
+async function runCompleteForwardAttemptUngated({ storybookUrl, jobId, attemptNum, baseUrl }) {
   let session = null;
   let browser = null;
   const log = { attempt: attemptNum, version: 'complete' };
