@@ -46,6 +46,110 @@ if (!HB_KEY) {
 const hb = new Hyperbrowser({ apiKey: HB_KEY });
 
 // ========================================================
+//  Session gate
+// ========================================================
+// Hyperbrowser caps how many sessions the team can run at once (25 on the
+// Startup plan). A session past the cap is refused, and a refused render is a
+// lost video. So this worker never holds more than MAX_SESSIONS at a time:
+// a render that arrives while every slot is taken waits its turn (up to
+// SESSION_WAIT_MS) instead of failing. A slot is released when its session is
+// stopped, and after SESSION_MAX_HOLD_MS at the latest, so a render that dies
+// without stopping its session cannot block the queue for good.
+//
+// Env vars (all optional):
+//   MAX_SESSIONS         sessions this worker may hold at once      (default 20)
+//   SESSION_WAIT_MS      longest a render waits for a free slot     (default 120000)
+//   SESSION_MAX_HOLD_MS  longest one session may hold a slot        (default 600000)
+const envInt = (name, fallback, min) => {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n >= min ? n : fallback;
+};
+const MAX_SESSIONS = envInt('MAX_SESSIONS', 20, 1);
+const SESSION_WAIT_MS = envInt('SESSION_WAIT_MS', 120000, 1000);
+const SESSION_MAX_HOLD_MS = envInt('SESSION_MAX_HOLD_MS', 600000, 60000);
+const HB_BUSY_RETRIES = 6;       // when Hyperbrowser itself says it is at its limit
+const HB_BUSY_WAIT_MS = 10000;
+
+let slotsInUse = 0;
+const slotWaiters = [];          // first in, first out
+const heldSessions = new Map();  // sessionId -> max-hold timer
+
+function sessionGateStats() {
+  return { max: MAX_SESSIONS, inUse: slotsInUse, waiting: slotWaiters.length };
+}
+
+function acquireSlot() {
+  if (slotsInUse < MAX_SESSIONS) {
+    slotsInUse++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = {};
+    waiter.grant = () => { clearTimeout(waiter.timer); resolve(); };
+    waiter.timer = setTimeout(() => {
+      const i = slotWaiters.indexOf(waiter);
+      if (i >= 0) slotWaiters.splice(i, 1);
+      reject(new Error(
+        `BUSY: all ${MAX_SESSIONS} session slots stayed in use for ${Math.round(SESSION_WAIT_MS / 1000)}s`
+      ));
+    }, SESSION_WAIT_MS);
+    slotWaiters.push(waiter);
+  });
+}
+
+function releaseSlot() {
+  const next = slotWaiters.shift();
+  if (next) next.grant();        // the slot goes straight to the next in line
+  else slotsInUse = Math.max(0, slotsInUse - 1);
+}
+
+function isHyperbrowserBusy(err) {
+  const msg = String((err && err.message) || '').toLowerCase();
+  return (err && err.statusCode === 429) || msg.includes('concurren') || msg.includes('too many');
+}
+
+async function createSessionGated(opts) {
+  await acquireSlot();
+  try {
+    let session = null;
+    for (let i = 0; ; i++) {
+      try {
+        session = await hb.sessions.create(opts);
+        break;
+      } catch (err) {
+        if (!isHyperbrowserBusy(err) || i >= HB_BUSY_RETRIES) throw err;
+        console.log(`session gate: Hyperbrowser is at its limit, retry ${i + 1}/${HB_BUSY_RETRIES} in ${HB_BUSY_WAIT_MS / 1000}s`);
+        await new Promise((r) => setTimeout(r, HB_BUSY_WAIT_MS));
+      }
+    }
+    const timer = setTimeout(() => {
+      if (!heldSessions.has(session.id)) return;
+      console.log(`session gate: ${session.id} held a slot for over ${Math.round(SESSION_MAX_HOLD_MS / 1000)}s, stopping it`);
+      stopSessionGated(session.id).catch(() => {});
+    }, SESSION_MAX_HOLD_MS);
+    timer.unref();
+    heldSessions.set(session.id, timer);
+    return session;
+  } catch (err) {
+    releaseSlot();
+    throw err;
+  }
+}
+
+async function stopSessionGated(sessionId) {
+  try {
+    return await hb.sessions.stop(sessionId);
+  } finally {
+    const timer = heldSessions.get(sessionId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      heldSessions.delete(sessionId);
+      releaseSlot();
+    }
+  }
+}
+
+// ========================================================
 //  helpers
 // ========================================================
 
@@ -421,7 +525,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     // Both take ~5-10s; running them in parallel means total setup ≈ max(both),
     // not sum. Net wall-clock cost of the cinemagraph fix is near zero.
     const [sessionResult, pretranscode] = await Promise.all([
-      hb.sessions.create({
+      createSessionGated({
         enableWebRecording: true,
         enableVideoWebRecording: true,
         screen: { width: 1920, height: 1080 },
@@ -622,7 +726,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
 
     try { await browser.close(); } catch {}
     browser = null;
-    try { await hb.sessions.stop(session.id); } catch (e) {
+    try { await stopSessionGated(session.id); } catch (e) {
       console.warn(`[${jobId}] stop warn: ${e.message}`);
     }
 
@@ -700,7 +804,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
     return { ok: false, log, fatal, error: e };
   } finally {
     if (browser) { try { await browser.close(); } catch {} }
-    if (session) { try { await hb.sessions.stop(session.id); } catch {} }
+    if (session) { try { await stopSessionGated(session.id); } catch {} }
     fs.rm(path.join(CINEMAGRAPHS_DIR, jobId), { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -712,7 +816,7 @@ async function runOneAttempt({ storybookUrl, jobId, attemptNum, baseUrl }) {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => res.json({ ok: true, sessions: sessionGateStats() }));
 
 app.get('/previews/:file', (req, res) => {
   const file = req.params.file;
@@ -1007,7 +1111,7 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
     console.log(`[${jobId}] LONG attempt ${attemptNum}: creating session + pretranscoding in parallel`);
 
     const [sessionResult, pretranscode] = await Promise.all([
-      hb.sessions.create({
+      createSessionGated({
         enableWebRecording: true,
         enableVideoWebRecording: true,
         screen: { width: 1920, height: 1080 },
@@ -1199,7 +1303,7 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
 
     try { await browser.close(); } catch {}
     browser = null;
-    try { await hb.sessions.stop(session.id); } catch (e) {
+    try { await stopSessionGated(session.id); } catch (e) {
       console.warn(`[${jobId}] LONG stop warn: ${e.message}`);
     }
 
@@ -1285,7 +1389,7 @@ async function runFullForwardAttempt({ storybookUrl, jobId, attemptNum, baseUrl 
     return { ok: false, log, fatal, error: e };
   } finally {
     if (browser) { try { await browser.close(); } catch {} }
-    if (session) { try { await hb.sessions.stop(session.id); } catch {} }
+    if (session) { try { await stopSessionGated(session.id); } catch {} }
     fs.rm(path.join(CINEMAGRAPHS_DIR, jobId), { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -1495,7 +1599,7 @@ async function runCompleteForwardAttempt({ storybookUrl, jobId, attemptNum, base
     console.log(`[${jobId}] COMPLETE attempt ${attemptNum}: creating session + pretranscoding in parallel`);
 
     const [sessionResult, pretranscode] = await Promise.all([
-      hb.sessions.create({
+      createSessionGated({
         enableWebRecording: true,
         enableVideoWebRecording: true,
         screen: { width: 1920, height: 1080 },
@@ -1676,7 +1780,7 @@ async function runCompleteForwardAttempt({ storybookUrl, jobId, attemptNum, base
 
     try { await browser.close(); } catch {}
     browser = null;
-    try { await hb.sessions.stop(session.id); } catch (e) {
+    try { await stopSessionGated(session.id); } catch (e) {
       console.warn(`[${jobId}] COMPLETE stop warn: ${e.message}`);
     }
 
@@ -1761,7 +1865,7 @@ async function runCompleteForwardAttempt({ storybookUrl, jobId, attemptNum, base
     return { ok: false, log, fatal, error: e };
   } finally {
     if (browser) { try { await browser.close(); } catch {} }
-    if (session) { try { await hb.sessions.stop(session.id); } catch {} }
+    if (session) { try { await stopSessionGated(session.id); } catch {} }
     fs.rm(path.join(CINEMAGRAPHS_DIR, jobId), { recursive: true, force: true }).catch(() => {});
   }
 }

@@ -60,3 +60,10 @@ Fails retry up to 3 attempts. If all 3 fail, response is 500 with the per-attemp
 |---|---|---|
 | `HB_KEY` | yes | Hyperbrowser API key |
 | `PORT` | no | Default 3000 |
+| `MAX_SESSIONS` | no | Most Hyperbrowser sessions this worker holds at once. Default 20 (the Startup plan allows 25 for the whole team). Extra renders wait their turn. |
+| `SESSION_WAIT_MS` | no | Longest a render waits for a free session slot before it fails with `BUSY`. Default 120000 |
+| `SESSION_MAX_HOLD_MS` | no | Longest one session may hold a slot before the worker stops it. Default 600000 |
+
+`GET /health` reports the queue: `{"ok":true,"sessions":{"max":20,"inUse":3,"waiting":0}}`.
+
+Run one replica only. The worker keeps each render's converted cinemagraphs on its own disk and the recording browser fetches them back through the public address, so a second replica would answer some of those requests with 404.
