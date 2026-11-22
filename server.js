@@ -166,7 +166,11 @@ async function stopSessionGated(sessionId) {
 //   - at most MAX_JOBS renders run at once. The rest wait in line, first in,
 //     first out, using no CPU and no Hyperbrowser session while they wait;
 //   - at most MAX_SETUP of the running renders may be in the conversion step
-//     at the same moment (that step is the CPU-heavy one);
+//     at the same moment (that step is the CPU-heavy one), and over all of them
+//     at most MAX_TRANSCODES ffmpeg conversions run at once. A book with ten
+//     cinemagraphs used to start ten at the same time; now they take turns;
+//   - a second or third attempt at the same video goes to the head of the line
+//     instead of the back, so a retry does not wait behind every newcomer;
 //   - a render that waits longer than JOB_WAIT_MS is turned away with a clear
 //     BUSY error, so the caller can try again instead of hanging;
 //   - if the same video is asked for again while it is still being made (a
@@ -178,11 +182,13 @@ async function stopSessionGated(sessionId) {
 //
 //   MAX_JOBS        renders running at once                        (default 10)
 //   MAX_SETUP       of those, how many may convert at once         (default 3)
+//   MAX_TRANSCODES  ffmpeg conversions at once, over all renders   (default 6)
 //   JOB_WAIT_MS     longest a render waits in line                 (default 150000)
 //   LOCAL_KEEP_MS   how long an uploaded video's local copy stays  (default 600000)
 // ---- job gate: begin (tests/job-gate.test.mjs runs this block) ----
 const MAX_JOBS = envInt('MAX_JOBS', 10, 1);
 const MAX_SETUP = envInt('MAX_SETUP', 3, 1);
+const MAX_TRANSCODES = envInt('MAX_TRANSCODES', 6, 1);
 const JOB_WAIT_MS = envInt('JOB_WAIT_MS', 150000, 100);
 const LOCAL_KEEP_MS = envInt('LOCAL_KEEP_MS', 600000, 1000);
 
@@ -191,7 +197,7 @@ function makeGate(max, waitMs, busyMessage) {
   let inUse = 0;
   const waiters = [];
   return {
-    acquire() {
+    acquire(front) {
       if (inUse < max) {
         inUse++;
         return Promise.resolve();
@@ -206,7 +212,8 @@ function makeGate(max, waitMs, busyMessage) {
             reject(new Error(busyMessage));
           }, waitMs);
         }
-        waiters.push(waiter);
+        if (front) waiters.unshift(waiter);     // a retry keeps its place at the head of the line
+        else waiters.push(waiter);
       });
     },
     release() {
@@ -226,6 +233,7 @@ const jobGate = makeGate(
   `BUSY - all ${MAX_JOBS} render places stayed taken for ${Math.round(JOB_WAIT_MS / 1000)}s, try again shortly`
 );
 const setupGate = makeGate(MAX_SETUP, 0, '');
+const transcodeGate = makeGate(MAX_TRANSCODES, 0, '');   // ffmpeg conversions running, over all renders
 const setupHolders = new Set();        // jobIds now in the conversion step
 const inFlightAttempts = new Map();    // jobId -> the attempt now running or waiting
 
@@ -244,7 +252,7 @@ function gatedAttempt(runAttempt, args) {
   const attempt = (async () => {
     const queuedAt = Date.now();
     try {
-      await jobGate.acquire();
+      await jobGate.acquire(args.attemptNum > 1);
     } catch (err) {
       console.warn(`[${jobId}] ${err.message}`);
       return {
@@ -255,7 +263,7 @@ function gatedAttempt(runAttempt, args) {
     }
     let result = null;
     try {
-      await setupGate.acquire();
+      await setupGate.acquire(args.attemptNum > 1);
       setupHolders.add(jobId);
       const queuedMs = Date.now() - queuedAt;
       if (queuedMs > 1000) console.log(`[${jobId}] waited ${Math.round(queuedMs / 1000)}s in line`);
@@ -613,7 +621,12 @@ async function pretranscodeCinemagraphsUngated(storybookUrl, jobId) {
         if (!dl.ok) throw new Error(`download ${dl.status}`);
         const buf = Buffer.from(await dl.arrayBuffer());
         await fs.writeFile(mp4Path, buf);
-        await transcodeToWebmVp8(mp4Path, webmPath);
+        await transcodeGate.acquire();
+        try {
+          await transcodeToWebmVp8(mp4Path, webmPath);
+        } finally {
+          transcodeGate.release();
+        }
         result.byMuxId[muxId] = webmPath;
         result.stats.transcoded++;
         await fs.unlink(mp4Path).catch(() => {});
@@ -684,19 +697,20 @@ async function runOneAttemptUngated({ storybookUrl, jobId, attemptNum, baseUrl }
   const log = { attempt: attemptNum };
 
   try {
-    console.log(`[${jobId}] attempt ${attemptNum}: creating session + pretranscoding in parallel`);
+    console.log(`[${jobId}] attempt ${attemptNum}: converting cinemagraphs, then opening the session`);
 
-    // Session create + cinemagraph pretranscoding run concurrently.
-    // Both take ~5-10s; running them in parallel means total setup ≈ max(both),
-    // not sum. Net wall-clock cost of the cinemagraph fix is near zero.
-    const [sessionResult, pretranscode] = await Promise.all([
-      createSessionGated({
-        enableWebRecording: true,
-        enableVideoWebRecording: true,
-        screen: { width: 1920, height: 1080 },
-      }),
-      pretranscodeCinemagraphs(storybookUrl, jobId),
-    ]);
+    // Convert first, open the browser session second. Hyperbrowser records from
+    // the moment the session exists and the trim further down measures from
+    // that moment, so nothing slow may sit between the two. (When the two ran
+    // side by side, a slow conversion pushed the cut that many seconds early:
+    // blank page at the start, the last pages cut off, and under load a whole
+    // clip of blank page that failed the size check.)
+    const pretranscode = await pretranscodeCinemagraphs(storybookUrl, jobId);
+    const sessionResult = await createSessionGated({
+      enableWebRecording: true,
+      enableVideoWebRecording: true,
+      screen: { width: 1920, height: 1080 },
+    });
     session = sessionResult;
     log.sessionId = session.id;
     log.pretranscode = pretranscode.stats;
@@ -1000,6 +1014,7 @@ app.get('/health', (req, res) => res.json({
   sessions: sessionGateStats(),
   jobs: jobGate.stats(),            // renders running, and waiting in line
   converting: setupGate.stats(),    // renders in the ffmpeg conversion step
+  transcodes: transcodeGate.stats(),// single ffmpeg conversions running, over all renders
   localVideos: localFiles,          // finished videos still on this machine's disk
   memoryMb: Math.round(process.memoryUsage().rss / 1048576),
 }));
@@ -1299,16 +1314,20 @@ async function runFullForwardAttemptUngated({ storybookUrl, jobId, attemptNum, b
   const log = { attempt: attemptNum, version: 'long' };
 
   try {
-    console.log(`[${jobId}] LONG attempt ${attemptNum}: creating session + pretranscoding in parallel`);
+    console.log(`[${jobId}] LONG attempt ${attemptNum}: converting cinemagraphs, then opening the session`);
 
-    const [sessionResult, pretranscode] = await Promise.all([
-      createSessionGated({
-        enableWebRecording: true,
-        enableVideoWebRecording: true,
-        screen: { width: 1920, height: 1080 },
-      }),
-      pretranscodeCinemagraphs(storybookUrl, jobId),
-    ]);
+    // Convert first, open the browser session second. Hyperbrowser records from
+    // the moment the session exists and the trim further down measures from
+    // that moment, so nothing slow may sit between the two. (When the two ran
+    // side by side, a slow conversion pushed the cut that many seconds early:
+    // blank page at the start, the last pages cut off, and under load a whole
+    // clip of blank page that failed the size check.)
+    const pretranscode = await pretranscodeCinemagraphs(storybookUrl, jobId);
+    const sessionResult = await createSessionGated({
+      enableWebRecording: true,
+      enableVideoWebRecording: true,
+      screen: { width: 1920, height: 1080 },
+    });
     session = sessionResult;
     log.sessionId = session.id;
     log.pretranscode = pretranscode.stats;
@@ -1792,16 +1811,20 @@ async function runCompleteForwardAttemptUngated({ storybookUrl, jobId, attemptNu
   const log = { attempt: attemptNum, version: 'complete' };
 
   try {
-    console.log(`[${jobId}] COMPLETE attempt ${attemptNum}: creating session + pretranscoding in parallel`);
+    console.log(`[${jobId}] COMPLETE attempt ${attemptNum}: converting cinemagraphs, then opening the session`);
 
-    const [sessionResult, pretranscode] = await Promise.all([
-      createSessionGated({
-        enableWebRecording: true,
-        enableVideoWebRecording: true,
-        screen: { width: 1920, height: 1080 },
-      }),
-      pretranscodeCinemagraphs(storybookUrl, jobId),
-    ]);
+    // Convert first, open the browser session second. Hyperbrowser records from
+    // the moment the session exists and the trim further down measures from
+    // that moment, so nothing slow may sit between the two. (When the two ran
+    // side by side, a slow conversion pushed the cut that many seconds early:
+    // blank page at the start, the last pages cut off, and under load a whole
+    // clip of blank page that failed the size check.)
+    const pretranscode = await pretranscodeCinemagraphs(storybookUrl, jobId);
+    const sessionResult = await createSessionGated({
+      enableWebRecording: true,
+      enableVideoWebRecording: true,
+      screen: { width: 1920, height: 1080 },
+    });
     session = sessionResult;
     log.sessionId = session.id;
     log.pretranscode = pretranscode.stats;

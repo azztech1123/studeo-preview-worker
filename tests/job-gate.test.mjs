@@ -19,7 +19,7 @@ function load(env) {
   };
   const quiet = { log() {}, warn() {}, error() {} };
   const make = new Function('envInt', 'fs', 'path', 'PREVIEWS_DIR', 'console',
-    block[1] + '\nreturn { gatedAttempt, releaseSetupSlot, jobGate, setupGate, inFlightAttempts };');
+    block[1] + '\nreturn { gatedAttempt, releaseSetupSlot, jobGate, setupGate, transcodeGate, inFlightAttempts };');
   return Object.assign(make(envInt, fs, path, PREVIEWS_DIR, quiet), { PREVIEWS_DIR });
 }
 
@@ -111,6 +111,52 @@ const check = (name, ok, detail) => {
   check('local files: video that is only here is kept', exists(file('localonly.mp4')));
   check('local files: an older timer does not delete a newer render', exists(file('failed.mp4')));
   fsSync.rmSync(g.PREVIEWS_DIR, { recursive: true, force: true });
+}
+
+// 6. A second attempt at a video goes to the head of the line, ahead of renders that were already waiting.
+{
+  const g = load({ MAX_JOBS: '1', MAX_SETUP: '1', JOB_WAIT_MS: '60000' });
+  const started = [];
+  const render = async ({ jobId, attemptNum }) => { started.push(jobId + '#' + attemptNum); g.releaseSetupSlot(jobId); await sleep(40); return { ok: true, log: {} }; };
+  const first = g.gatedAttempt(render, { jobId: 'a', attemptNum: 1 });
+  const waitingB = g.gatedAttempt(render, { jobId: 'b', attemptNum: 1 });
+  const waitingC = g.gatedAttempt(render, { jobId: 'c', attemptNum: 1 });
+  await first;                                                            // a's first attempt ends; b now runs, c waits
+  const retryA = g.gatedAttempt(render, { jobId: 'a', attemptNum: 2 });   // must go ahead of c
+  await Promise.all([waitingB, waitingC, retryA]);
+  check('retry: second attempt runs before renders already in line', started.join() === 'a#1,b#1,a#2,c#1', started.join());
+  check('retry: gate is empty afterwards', g.jobGate.stats().inUse === 0 && g.jobGate.stats().waiting === 0);
+}
+
+// 7. ffmpeg conversions take turns: never more than MAX_TRANSCODES at once, however many a render asks for.
+{
+  const g = load({ MAX_TRANSCODES: '3' });
+  let running = 0, peak = 0, done = 0;
+  const one = async () => {
+    await g.transcodeGate.acquire();
+    try { running++; peak = Math.max(peak, running); await sleep(15); running--; done++; }
+    finally { g.transcodeGate.release(); }
+  };
+  await Promise.all(Array.from({ length: 25 }, one));
+  check('conversions: all 25 finish', done === 25, done + ' of 25');
+  check('conversions: never more than 3 at once', peak <= 3, 'peak ' + peak);
+  check('conversions: gate is empty afterwards', g.transcodeGate.stats().inUse === 0 && g.transcodeGate.stats().waiting === 0);
+}
+
+// 8. In every render path the cinemagraphs are converted BEFORE the browser session is opened,
+//    and the two are never started side by side again (that is what misplaced the cut).
+{
+  const paths = src.split('\n').filter((l) => /^async function run\w+AttemptUngated\(/.test(l)).length;
+  const bodies = src.split(/^async function run\w+AttemptUngated\(/m).slice(1);
+  const inOrder = bodies.every((b) => {
+    const convert = b.indexOf('await pretranscodeCinemagraphs(');
+    const session = b.indexOf('await createSessionGated(');
+    const anchor = b.indexOf('const recordingT0Ms = Date.now()');
+    return convert >= 0 && session > convert && anchor > session;
+  });
+  check('order: three render paths found', paths === 3 && bodies.length === 3, paths + ' found');
+  check('order: convert, then open session, then set the recording anchor', inOrder);
+  check('order: session and conversion are not started together', !/Promise\.all\(\[\s*createSessionGated/.test(src));
 }
 
 console.log(failures === 0 ? '\nAll checks passed.' : '\n' + failures + ' check(s) FAILED.');
